@@ -67,6 +67,9 @@ API 키 발급: https://upbit.com/service_center/open_api_guide
 
 모든 명령어는 `upbit_bot/` 디렉토리에서 실행합니다.
 
+자동매매 대시보드: http://localhost:8501
+사용자 대시보드: http://localhost:8001
+
 ### 트레이딩
 
 ```bash

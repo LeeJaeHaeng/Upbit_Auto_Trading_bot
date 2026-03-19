@@ -267,7 +267,8 @@ class EnhancedBacktester:
                             })
             else:
                 highest_price = max(highest_price, row["close"])
-                sell_result = get_sell_signal(row, self.config, entry_price, highest_price)
+                current_pnl_pct = (row["close"] - entry_price) / entry_price * 100
+                sell_result = get_sell_signal(row, self.config, entry_price, highest_price, current_pnl_pct)
 
                 if sell_result["should_sell"]:
                     # 매도: 다음 캔들 시가 - 슬리피지 (불리한 방향)

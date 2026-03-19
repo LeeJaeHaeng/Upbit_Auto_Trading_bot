@@ -184,9 +184,19 @@ def get_signal_score(row: pd.Series, config) -> dict:
     return {"signals": signals, "score": score, "details": details}
 
 
-def get_sell_signal(row: pd.Series, config, entry_price: float, highest_price: float) -> dict:
+def get_sell_signal(
+    row: pd.Series,
+    config,
+    entry_price: float,
+    highest_price: float,
+    current_pnl_pct: float = None,
+) -> dict:
     """
     매도 신호를 판단합니다.
+
+    Args:
+        current_pnl_pct: 현재 손익률(%). None이면 내부 계산.
+                         TECHNICAL_EXIT_MIN_PCT 체크에 사용됩니다.
 
     반환값: {
         'should_sell': True/False,
@@ -197,21 +207,34 @@ def get_sell_signal(row: pd.Series, config, entry_price: float, highest_price: f
     rsi = row["rsi"]
     bb_pct = row["bb_pct"]
 
-    # 1. 손절 (Stop Loss)
     pnl_pct = (close - entry_price) / entry_price
+    if current_pnl_pct is None:
+        current_pnl_pct = pnl_pct * 100
+
+    # 1. 본전 보호 스탑 (Breakeven Stop)
+    breakeven_trigger = getattr(config, "BREAKEVEN_TRIGGER_PCT", 0.0)
+    if breakeven_trigger > 0:
+        fee_buffer = getattr(config, "FEE_RATE", 0.0005) * 2
+        breakeven_sl = entry_price * (1 + fee_buffer)
+        # 한 번이라도 BREAKEVEN_TRIGGER_PCT 이상 수익을 달성했다면 본전 스탑 적용
+        peak_pnl = (highest_price - entry_price) / entry_price
+        if peak_pnl >= breakeven_trigger and close <= breakeven_sl:
+            return {"should_sell": True, "reason": f"본전 보호 스탑 ({current_pnl_pct:.2f}%)"}
+
+    # 2. 손절 (Stop Loss)
     if pnl_pct <= -config.STOP_LOSS_PCT:
         return {"should_sell": True, "reason": f"손절 ({pnl_pct*100:.2f}%)"}
 
-    # 2. 익절 (Take Profit)
+    # 3. 익절 (Take Profit)
     if pnl_pct >= config.TAKE_PROFIT_PCT:
         return {"should_sell": True, "reason": f"익절 ({pnl_pct*100:.2f}%)"}
 
-    # 3. 트레일링 스탑 (고점 대비 하락)
+    # 4. 트레일링 스탑 (고점 대비 하락)
     drawdown = (close - highest_price) / highest_price
     if pnl_pct > 0.01 and drawdown <= -config.TRAILING_STOP_PCT:
         return {"should_sell": True, "reason": f"트레일링 스탑 (고점 대비 {drawdown*100:.2f}%)"}
 
-    # 4. 기술적 매도 신호
+    # 5. 기술적 매도 신호
     sell_signals = 0
     if rsi > config.RSI_OVERBOUGHT:
         sell_signals += 1
@@ -222,6 +245,10 @@ def get_sell_signal(row: pd.Series, config, entry_price: float, highest_price: f
         sell_signals += 1
 
     if sell_signals >= 2:
-        return {"should_sell": True, "reason": f"기술적 매도 신호 {sell_signals}개"}
+        # 소수익 구간(0% ~ TECHNICAL_EXIT_MIN_PCT)에서는 기술적 신호 청산 차단
+        # → 조기 청산 방지, 손실 중이거나 충분한 수익이면 정상 청산
+        min_exit_pct = getattr(config, "TECHNICAL_EXIT_MIN_PCT", 0.0) * 100
+        if current_pnl_pct < 0 or current_pnl_pct >= min_exit_pct:
+            return {"should_sell": True, "reason": f"기술적 매도 신호 {sell_signals}개"}
 
     return {"should_sell": False, "reason": ""}

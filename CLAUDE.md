@@ -181,10 +181,28 @@ Django port: 8001, Streamlit port: 8501 (auto-increments if occupied). PIDs trac
 | `STOP_LOSS_PCT` | 0.020 | 손절 2.0% |
 | `TAKE_PROFIT_PCT` | 0.030 | 익절 3.0% |
 | `TRAILING_STOP_PCT` | 0.010 | 트레일링 스탑 1.0% |
+| `VOLUME_THRESHOLD` | **1.5** | 2.0 상향 시 역효과 확인됨 (25→15거래, -0.02%→-0.26%) — 1.5 유지 |
 | `USE_TREND_FILTER` | True | EMA200 하락장 필터 활성화 |
 | `TREND_FILTER_STRICT` | False | strict=False: close < EMA200 AND ema50 < EMA200 모두 충족 시만 차단 |
+| `BREAKEVEN_TRIGGER_PCT` | 0.010 | 1% 수익 도달 시 손절선을 매수가+수수료로 이동 (소손실 방어) |
+| `TECHNICAL_EXIT_MIN_PCT` | 0.005 | 0%~0.5% 소수익 구간 기술적 청산 차단 (조기 청산 방지) |
+| `MTF_CHECK` | True | 4시간봉 EMA20>EMA50 확인 후 60분봉 진입 허용 |
+| `SCALED_ENTRY` | True | 분할투자: 1차 60% → -1.5% 하락 시 2차 40% 매수, 30분 타임아웃 |
+
+### 전략 개선 전후 백테스팅 비교 (90일, KRW-BTC, 2026-03-19 기준)
+
+| 시나리오 | 수익률 | 승률 | 거래수 | 평균수익 | 평균손실 | MDD |
+| --- | --- | --- | --- | --- | --- | --- |
+| 버그수정 전 | -0.02% | 60.0% | 25회 | +1.03% | -1.57% | -0.89% |
+| VOLUME=2.0 적용 | -0.26% | 53.3% | 15회 | — | — | — |
+| **최종 (VOLUME=1.5 + exit 개선)** | **+0.00%** | **52.2%** | **23회** | **+1.13%** | **-1.23%** | **-0.89%** |
+| Buy&Hold 동일 기간 | -20.76% | — | — | — | — | — |
+
+**개선 포인트**: 평균 손실 -1.57% → -1.23% (본전 보호 스탑 효과), 평균 수익 +1.03% → +1.13% (소수익 조기청산 방지)
 
 ### 수정된 버그 목록 (2026-03-19)
+
+**버그 수정:**
 
 1. **`indicators.py`** — `get_signal_score()`: RSI 신호 조건이 `config.RSI_OVERSOLD + 5` 하드코딩 → `config.RSI_OVERSOLD` 직접 사용으로 수정
 2. **`order_manager.py`** — `place_limit_buy()`: 활성 매수 주문 존재 시 중복 방지 로직 추가
@@ -194,3 +212,12 @@ Django port: 8001, Streamlit port: 8501 (auto-increments if occupied). PIDs trac
 6. **`trader.py`** — `_on_buy_filled()`: paper_capital 차감 시 수수료 미포함 버그 수정
 7. **`trader.py`** — `_dynamic_adjust_exit()`: update_exit_prices() 직전 race condition 방지용 체결 재확인
 8. **`trader.py`** — `_shutdown()`: input() 무한 대기 → 30초 타임아웃 (threading 기반)
+
+**전략 개선 (신규 기능):**
+9. **`trader.py`** — 하락장 3단계 방어: IDLE 진입차단 / BUY_WAITING 매 3사이클 재확인 후 취소 / POSITION 하락장 전환 시 SL 강화
+10. **`trader.py`** — 비정상 종료 복구: atexit/SIGTERM 시 `bot_state.json` 저장 → 재시작 시 y/s/n 선택
+11. **`trader.py`** — 연속 오류 10회 초과 시 긴급 상태 저장 후 봇 자동 종료 (`_emergency_shutdown`)
+12. **`trader.py`** — 분할투자 DCA: `_on_dca_filled()` — 1차 매수 후 -1.5% 하락 시 2차 매수, 평균단가 재계산
+13. **`trader.py`** — MTF 4시간봉 추세 확인: `_check_mtf_trend()` — EMA20>EMA50이어야 진입 허용
+14. **`indicators.py`** — `get_sell_signal()`: 본전 보호 스탑 (`BREAKEVEN_TRIGGER_PCT`) + 소수익 청산 차단 (`TECHNICAL_EXIT_MIN_PCT`) 추가
+15. **`config.py`** — VOLUME_THRESHOLD 2.0→1.5 복원 (2.0은 거래수 감소로 역효과 확인)

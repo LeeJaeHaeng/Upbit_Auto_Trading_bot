@@ -69,6 +69,17 @@ class Trader:
         self.adjust_counter = 0
         self.adjust_every = 5
 
+        # 분할 투자 (DCA) 추적 변수
+        self._dca_trigger_price = 0.0   # 2차 매수 트리거 가격 (1차 매수가 × (1 - DIP))
+        self._dca_amount = 0.0          # 2차 매수 금액
+        self._dca_done = False          # 2차 매수 완료 여부
+        self._dca_order_pending = False # 2차 매수 주문 체결 대기 중
+        self._dca_timeout_at = None     # 2차 매수 대기 만료 시각
+        self._avg_entry_price = 0.0     # 분할 매수 후 평균 단가
+
+        # 본전 보호 활성화 추적
+        self._breakeven_activated = False
+
         # 연속 오류 카운터 (일정 횟수 초과 시 긴급 종료)
         self._consecutive_errors = 0
         self._max_consecutive_errors = 10
@@ -136,6 +147,52 @@ class Trader:
     # ──────────────────────────────────────────
     # 상태 핸들러
     # ──────────────────────────────────────────
+
+    # ──────────────────────────────────────────
+    # 다중 시간대 추세 확인 (4h EMA)
+    # ──────────────────────────────────────────
+
+    def _check_mtf_trend(self, market: str) -> dict:
+        """
+        4시간봉 EMA20/EMA50 추세를 확인합니다.
+        60분봉 신호가 4h 추세와 일치할 때만 진입을 허용합니다.
+
+        반환: {'allowed': bool, 'reason': str, 'ema_short': float, 'ema_long': float}
+        """
+        if not getattr(self.config, "MTF_CHECK", False):
+            return {"allowed": True, "reason": "MTF 비활성화"}
+
+        try:
+            mtf_unit = getattr(self.config, "MTF_CANDLE_UNIT", 240)
+            df = pyupbit.get_ohlcv(market, interval=f"minute{mtf_unit}", count=60)
+            if df is None or len(df) < 55:
+                return {"allowed": True, "reason": "4h 데이터 부족 — MTF 스킵"}
+
+            df.columns = ["open", "high", "low", "close", "volume", "value"]
+            closes = df["close"]
+            ema_short = getattr(self.config, "MTF_EMA_SHORT", 20)
+            ema_long = getattr(self.config, "MTF_EMA_LONG", 50)
+            mtf_ema_s = float(closes.ewm(span=ema_short, adjust=False).mean().iloc[-1])
+            mtf_ema_l = float(closes.ewm(span=ema_long,  adjust=False).mean().iloc[-1])
+
+            # 4h 단기 EMA > 장기 EMA → 상승 추세, 진입 허용
+            if mtf_ema_s >= mtf_ema_l:
+                return {
+                    "allowed": True,
+                    "reason": f"4h 상승 추세 (EMA{ema_short}={mtf_ema_s:,.0f} ≥ EMA{ema_long}={mtf_ema_l:,.0f})",
+                    "ema_short": mtf_ema_s,
+                    "ema_long": mtf_ema_l,
+                }
+            else:
+                return {
+                    "allowed": False,
+                    "reason": f"4h 하락 추세 (EMA{ema_short}={mtf_ema_s:,.0f} < EMA{ema_long}={mtf_ema_l:,.0f}) → 진입 차단",
+                    "ema_short": mtf_ema_s,
+                    "ema_long": mtf_ema_l,
+                }
+        except Exception as e:
+            logger.warning(f"MTF 체크 오류: {e} → 스킵")
+            return {"allowed": True, "reason": f"MTF 오류: {e}"}
 
     # ──────────────────────────────────────────
     # 시장 국면 필터 (하락장 진입 차단)
@@ -234,6 +291,13 @@ class Trader:
         print(f"  {regime_emoji.get(trend['regime'], '❓')} 시장 국면: {trend['reason']}")
         if not trend["allowed"]:
             print(f"  ⛔ 하락장 진입 차단 → 다음 사이클 대기")
+            return
+
+        # ── 4시간봉 추세 확인 (MTF 필터) ──
+        mtf = self._check_mtf_trend(best_market)
+        print(f"  📊 4h 추세: {mtf['reason']}")
+        if not mtf["allowed"]:
+            print(f"  ⛔ 4h 하락 추세 — 60분봉 신호 무시 → 다음 사이클 대기")
             return
 
         # 시장 환경 체크 (기술적 지표 외 매개변수)
@@ -387,6 +451,24 @@ class Trader:
 
         print(f"  📤 익절 주문: {fmt_price(tp_price)} | 손절 주문: {fmt_price(sl_price)}")
 
+        # ── 분할 투자 (DCA) 설정 ──
+        self._avg_entry_price = self.entry_price
+        self._breakeven_activated = False
+        scaled = getattr(self.config, "SCALED_ENTRY", False)
+        if scaled and not self._dca_done:
+            dip = getattr(self.config, "SCALED_ENTRY_DIP_PCT", 0.015)
+            ratio_1st = getattr(self.config, "SCALED_ENTRY_1ST_RATIO", 0.6)
+            timeout_min = getattr(self.config, "SCALED_ENTRY_TIMEOUT_MIN", 30)
+            self._dca_trigger_price = self.entry_price * (1 - dip)
+            self._dca_amount = self._pending_trade_amount * (1 - ratio_1st) / ratio_1st
+            from datetime import timedelta
+            self._dca_timeout_at = datetime.now() + timedelta(minutes=timeout_min)
+            print(
+                f"  🔀 DCA 설정: 2차 매수 트리거 {fmt_price(self._dca_trigger_price)} "
+                f"({dip*100:.1f}% 하락 시) | 금액={self._dca_amount:,.0f}원 | "
+                f"만료={timeout_min}분"
+            )
+
         # 상태 전이
         self.state = STATE_POSITION
         self.adjust_counter = 0
@@ -425,6 +507,34 @@ class Trader:
             self._on_sell_filled(sell_result)
             return
 
+        # ── DCA 2차 매수 관리 ──
+        if self._dca_order_pending and self.order_mgr.active_buy_order is not None:
+            # 2차 매수 체결 확인
+            if self.order_mgr.check_buy_order_filled(market):
+                self._on_dca_filled()
+        elif (
+            not self._dca_done
+            and not self._dca_order_pending
+            and self._dca_trigger_price > 0
+            and self.order_mgr.active_buy_order is None
+        ):
+            if self._dca_timeout_at and datetime.now() > self._dca_timeout_at:
+                # 타임아웃: 2차 매수 없이 1차만으로 포지션 확정
+                logger.info("DCA 2차 매수 타임아웃 → 1차 포지션으로 확정")
+                self._dca_done = True
+                self._dca_trigger_price = 0.0
+            elif current_price <= self._dca_trigger_price:
+                # 트리거 가격 도달 → 2차 매수 주문 실행
+                order = self.order_mgr.place_limit_buy(
+                    market, current_price, self._dca_amount
+                )
+                if order:
+                    self._dca_order_pending = True
+                    print(
+                        f"  🔀 DCA 2차 매수 주문! "
+                        f"가격={fmt_price(current_price)} | 금액={self._dca_amount:,.0f}원"
+                    )
+
         # ── 차트 분석 → 동적 익절/손절 조정 ──
         self.adjust_counter += 1
         if self.adjust_counter % self.adjust_every == 0:
@@ -446,6 +556,31 @@ class Trader:
 
         row = df.iloc[-1]
         pnl_pct = (current_price - self.entry_price) / self.entry_price
+
+        # ── 본전 보호 스탑 (Breakeven Stop) ──
+        breakeven_trigger = getattr(self.config, "BREAKEVEN_TRIGGER_PCT", 0.0)
+        if breakeven_trigger > 0 and not self._breakeven_activated and pnl_pct >= breakeven_trigger:
+            fee_buffer = self.config.FEE_RATE * 2
+            breakeven_sl = self.order_mgr._round_to_tick(
+                self.entry_price * (1 + fee_buffer), current_price
+            )
+            if self.order_mgr.active_sl_order and breakeven_sl > self.order_mgr.active_sl_order["price"]:
+                self._breakeven_activated = True
+                print(
+                    f"  🛡️ 본전 보호 활성화! (수익 {pnl_pct*100:.2f}% ≥ {breakeven_trigger*100:.1f}%) "
+                    f"SL → {fmt_price(breakeven_sl)}"
+                )
+                # 기존 SL 주문을 본전 스탑으로 교체
+                new_tp = self.order_mgr.active_tp_order["price"] if self.order_mgr.active_tp_order else \
+                         self.order_mgr._round_to_tick(
+                             self.entry_price * (1 + self.config.TAKE_PROFIT_PCT), current_price
+                         )
+                pre_check = self.order_mgr.check_sell_orders(market)
+                if pre_check["filled"]:
+                    self._on_sell_filled(pre_check)
+                    return
+                self.order_mgr.update_exit_prices(market, new_tp, breakeven_sl, self.coin_qty)
+                self._save_state()
 
         # ── 트레일링 스탑 로직 ──
         # 수익 중이면 손절선을 올려서 수익 보호
@@ -520,8 +655,11 @@ class Trader:
         volume_spike = row["volume_ratio"] > 3.0
 
         danger_count = sum([macd_dead_cross, rsi_falling, volume_spike])
-        if danger_count >= 2 and pnl_pct > 0:
-            print(f"  ⚠️ 위험 신호 {danger_count}개 감지! → 시장가 즉시 청산")
+        min_exit_pct = getattr(self.config, "TECHNICAL_EXIT_MIN_PCT", 0.0)
+        # 손실 중이거나 충분한 수익(min_exit_pct 이상)일 때만 기술적 신호 청산 허용
+        tech_exit_allowed = pnl_pct < 0 or pnl_pct >= min_exit_pct
+        if danger_count >= 2 and tech_exit_allowed:
+            print(f"  ⚠️ 위험 신호 {danger_count}개 감지 (손익 {pnl_pct*100:+.2f}%) → 시장가 즉시 청산")
             self.order_mgr.cancel_sell_orders()
             order = self.client.sell_market_order(market, self.coin_qty)
             if order:
@@ -530,6 +668,50 @@ class Trader:
                 if self.config.PAPER_TRADING:
                     self.paper_capital += order.get("revenue", self.coin_qty * current_price)
                 self._record_sell(exit_price, fee, "위험신호 시장가 청산")
+
+    def _on_dca_filled(self):
+        """DCA 2차 매수 체결 처리 — 평균 단가 재계산 + TP/SL 재설정"""
+        order = self.order_mgr.active_buy_order
+        if order is None:
+            return
+
+        dca_price = order["price"]
+        dca_qty = order["volume"]
+        dca_fee = order["fee"]
+
+        # 평균 단가 = (1차 금액 + 2차 금액) / 총 수량
+        total_cost = self.entry_price * self.coin_qty + dca_price * dca_qty
+        self.coin_qty += dca_qty
+        self._avg_entry_price = total_cost / self.coin_qty
+        self.entry_price = self._avg_entry_price  # PnL 계산 기준도 평균단가로
+
+        if self.config.PAPER_TRADING:
+            self.paper_capital -= (self._dca_amount + dca_fee)
+
+        # TP/SL을 평균단가 기준으로 재설정
+        new_tp = self.order_mgr._round_to_tick(
+            self.entry_price * (1 + self.config.TAKE_PROFIT_PCT),
+            self.entry_price,
+        )
+        new_sl = self.order_mgr._round_to_tick(
+            self.entry_price * (1 - self.config.STOP_LOSS_PCT),
+            self.entry_price,
+        )
+        self.order_mgr.cancel_sell_orders()
+        self.order_mgr.place_limit_sell(self.current_market, new_tp, self.coin_qty, "tp")
+        self.order_mgr.place_limit_sell(self.current_market, new_sl, self.coin_qty, "sl")
+        self.order_mgr.active_buy_order = None  # DCA 완료 — 매수 주문 클리어
+
+        self._dca_done = True
+        self._dca_order_pending = False
+        self._breakeven_activated = False  # 새 평균단가 기준으로 초기화
+        self._save_state()
+
+        print(
+            f"  ✅ DCA 2차 체결! | 평균단가={fmt_price(self.entry_price)} | "
+            f"총수량={self.coin_qty:.8f} | "
+            f"새 TP={fmt_price(new_tp)} SL={fmt_price(new_sl)}"
+        )
 
     def _on_sell_filled(self, sell_result: dict):
         """매도 체결 시 처리"""
@@ -581,6 +763,15 @@ class Trader:
         self.coin_qty = 0.0
         self.highest_price = 0.0
         self.order_mgr.clear_all()
+
+        # DCA 변수 초기화
+        self._dca_trigger_price = 0.0
+        self._dca_amount = 0.0
+        self._dca_done = False
+        self._dca_order_pending = False
+        self._dca_timeout_at = None
+        self._avg_entry_price = 0.0
+        self._breakeven_activated = False
 
         # 포지션 정리 완료 — 상태 파일 삭제
         self._clear_state()
