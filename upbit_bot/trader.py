@@ -10,10 +10,13 @@
 6. 매도 체결 → 수익 기록 → 1번으로 복귀
 """
 
+import atexit
+import json
 import time
 import logging
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -66,8 +69,22 @@ class Trader:
         self.adjust_counter = 0
         self.adjust_every = 5
 
+        # 연속 오류 카운터 (일정 횟수 초과 시 긴급 종료)
+        self._consecutive_errors = 0
+        self._max_consecutive_errors = 10
+
+        # 상태 영속화 파일 (비정상 종료 후 복구용)
+        self._state_file = Path(config.BASE_DIR) / "bot_state.json"
+
+        # BUY_WAITING/POSITION 중 국면 재확인 카운터
+        self._trend_check_counter = 0
+        self._trend_check_every = 3  # 매 3사이클(3분)마다 국면 재확인
+
     def run(self):
         """메인 트레이딩 루프"""
+        # 예상치 못한 종료(atexit, SIGTERM 등) 시 상태 저장 등록
+        atexit.register(self._emergency_shutdown)
+
         mode = "📄 페이퍼 트레이딩" if self.config.PAPER_TRADING else "💰 실거래"
         print(f"\n{'='*60}")
         print(f"  🤖 업비트 AI 자동매매 봇 시작 ({mode})")
@@ -77,7 +94,8 @@ class Trader:
         print(f"  손절: {self.config.STOP_LOSS_PCT*100:.1f}% | 익절: {self.config.TAKE_PROFIT_PCT*100:.1f}%")
         print(f"{'='*60}\n")
 
-        scan_cycle = 0
+        # 이전 실행 상태 복구 시도 (비정상 종료 후 재시작 시)
+        self._try_recover_state()
 
         while True:
             try:
@@ -92,6 +110,7 @@ class Trader:
                 elif self.state == STATE_POSITION:
                     self._handle_position(now)
 
+                self._consecutive_errors = 0  # 정상 사이클 시 오류 카운터 리셋
                 time.sleep(self.config.CHECK_INTERVAL)
 
             except KeyboardInterrupt:
@@ -99,8 +118,20 @@ class Trader:
                 self._shutdown()
                 break
             except Exception as e:
-                logger.error(f"루프 오류: {e}", exc_info=True)
-                time.sleep(30)
+                self._consecutive_errors += 1
+                wait_sec = min(30 * self._consecutive_errors, 300)  # 최대 5분 대기
+                logger.error(
+                    f"루프 오류 (연속 {self._consecutive_errors}회): {e} "
+                    f"— {wait_sec}초 후 재시도",
+                    exc_info=True,
+                )
+                if self._consecutive_errors >= self._max_consecutive_errors:
+                    logger.critical(
+                        f"연속 오류 {self._max_consecutive_errors}회 초과 → 긴급 상태 저장 후 종료"
+                    )
+                    self._emergency_shutdown()
+                    break
+                time.sleep(wait_sec)
 
     # ──────────────────────────────────────────
     # 상태 핸들러
@@ -285,6 +316,19 @@ class Trader:
             print(f"  📈 가격이 주문가 대비 {diff_pct:.1f}% 상승 → 주문 취소 → 재분석")
             self.order_mgr.cancel_buy_order(market)
             self.state = STATE_IDLE
+            return
+
+        # 매수 대기 중 하락장 전환 감지 (매 N사이클마다 국면 재확인)
+        self._trend_check_counter += 1
+        if self._trend_check_counter % self._trend_check_every == 0:
+            trend = self._check_trend_filter(market)
+            if not trend["allowed"]:
+                print(
+                    f"  📉 매수 대기 중 하락장 전환 감지: {trend['reason']}"
+                    f"\n  ⛔ 매수 주문 즉시 취소 → 재스캔"
+                )
+                self.order_mgr.cancel_buy_order(market)
+                self.state = STATE_IDLE
 
     def _on_buy_filled(self, market: str):
         """매수 체결 시 처리"""
@@ -346,6 +390,9 @@ class Trader:
         # 상태 전이
         self.state = STATE_POSITION
         self.adjust_counter = 0
+
+        # 포지션 정보를 파일에 저장 (비정상 종료 시 복구용)
+        self._save_state()
 
     def _handle_position(self, now: str):
         """POSITION: 포지션 보유 중 — 체결 확인 + 차트 분석 + 동적 조정"""
@@ -428,6 +475,44 @@ class Trader:
                         market, new_tp, new_sl, self.coin_qty
                     )
 
+        # ── 포지션 보유 중 하락장 전환 감지 → SL 강화 ──
+        trend = self._check_trend_filter(market)
+        if not trend["allowed"] and trend["regime"] == "bear":
+            logger.warning(f"포지션 보유 중 하락장 전환 감지: {trend['reason']}")
+            if pnl_pct > 0:
+                # 수익 중: 현재가 기준 타이트한 손절 (수익 보호 최우선)
+                tight_sl = current_price * (1 - self.config.TRAILING_STOP_PCT)
+                tight_sl = self.order_mgr._round_to_tick(tight_sl, current_price)
+                # 익절도 당기기 (TP = 현재가 기준 절반 남은 수익)
+                tight_tp = current_price * (1 + self.config.TAKE_PROFIT_PCT * 0.5)
+                tight_tp = self.order_mgr._round_to_tick(tight_tp, current_price)
+                if self.order_mgr.active_sl_order and tight_sl > self.order_mgr.active_sl_order["price"]:
+                    print(
+                        f"  📉 하락장 전환 → 수익 보호 SL 강화: "
+                        f"{fmt_price(self.order_mgr.active_sl_order['price'])} → {fmt_price(tight_sl)}"
+                    )
+                    pre_check = self.order_mgr.check_sell_orders(market)
+                    if pre_check["filled"]:
+                        self._on_sell_filled(pre_check)
+                        return
+                    self.order_mgr.update_exit_prices(market, tight_tp, tight_sl, self.coin_qty)
+                    self._save_state()
+            else:
+                # 손실 중: 하락장 전환 시 즉시 시장가 청산 (추가 손실 방지)
+                print(
+                    f"  📉 하락장 전환 + 손실 포지션 → 즉시 시장가 청산 "
+                    f"(현재 손익: {pnl_pct*100:+.2f}%)"
+                )
+                self.order_mgr.cancel_sell_orders()
+                order = self.client.sell_market_order(market, self.coin_qty)
+                if order:
+                    exit_price = order.get("price", current_price)
+                    fee = order.get("fee", 0)
+                    if self.config.PAPER_TRADING:
+                        self.paper_capital += order.get("revenue", self.coin_qty * current_price)
+                    self._record_sell(exit_price, fee, "하락장 전환 긴급 청산")
+                return
+
         # ── 위험 신호 감지: 즉시 시장가 청산 ──
         # MACD 데드크로스 + RSI 급락 + 거래량 급증 = 급락 신호
         macd_dead_cross = row["macd_hist"] < 0 and row["macd"] > 0
@@ -497,7 +582,149 @@ class Trader:
         self.highest_price = 0.0
         self.order_mgr.clear_all()
 
+        # 포지션 정리 완료 — 상태 파일 삭제
+        self._clear_state()
+
         self.trade_logger.print_summary()
+
+    # ──────────────────────────────────────────
+    # 상태 영속화 (비정상 종료 복구)
+    # ──────────────────────────────────────────
+
+    def _save_state(self):
+        """현재 포지션 정보를 파일에 저장합니다. 비정상 종료 후 재시작 시 복구에 사용됩니다."""
+        if self.state not in (STATE_POSITION, STATE_BUY_WAITING):
+            return
+
+        state_data = {
+            "state": self.state,
+            "market": self.current_market,
+            "entry_price": self.entry_price,
+            "coin_qty": self.coin_qty,
+            "highest_price": self.highest_price,
+            "paper_capital": self.paper_capital,
+            "saved_at": datetime.now().isoformat(),
+        }
+        if self.order_mgr.active_tp_order:
+            state_data["tp_price"] = self.order_mgr.active_tp_order["price"]
+        if self.order_mgr.active_sl_order:
+            state_data["sl_price"] = self.order_mgr.active_sl_order["price"]
+        if self.order_mgr.active_buy_order:
+            state_data["buy_price"] = self.order_mgr.active_buy_order["price"]
+
+        try:
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                json.dump(state_data, f, indent=2, ensure_ascii=False)
+            logger.debug(f"봇 상태 저장 완료: {self.state} | {self.current_market}")
+        except Exception as e:
+            logger.warning(f"상태 파일 저장 실패: {e}")
+
+    def _clear_state(self):
+        """상태 파일을 삭제합니다."""
+        try:
+            if self._state_file.exists():
+                self._state_file.unlink()
+        except Exception as e:
+            logger.warning(f"상태 파일 삭제 실패: {e}")
+
+    def _try_recover_state(self):
+        """봇 시작 시 이전 상태 파일이 있으면 복구를 시도합니다."""
+        if not self._state_file.exists():
+            return
+
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+        except Exception as e:
+            logger.warning(f"상태 파일 읽기 실패: {e}")
+            self._clear_state()
+            return
+
+        saved_state = state_data.get("state")
+        market = state_data.get("market", "UNKNOWN")
+        entry_price = state_data.get("entry_price", 0.0)
+        coin_qty = state_data.get("coin_qty", 0.0)
+        saved_at = state_data.get("saved_at", "unknown")
+
+        print(f"\n{'='*60}")
+        print(f"  ⚠️  이전 실행 상태 파일 감지! (저장: {saved_at})")
+        print(f"  상태: {saved_state} | 마켓: {market}")
+        print(f"  진입가: {fmt_price(entry_price)} | 수량: {coin_qty:.8f}")
+
+        if saved_state == STATE_POSITION and market and market != "UNKNOWN":
+            tp_price = state_data.get("tp_price", 0.0)
+            sl_price = state_data.get("sl_price", 0.0)
+            if tp_price:
+                print(f"  TP: {fmt_price(tp_price)} | SL: {fmt_price(sl_price)}")
+            print(f"{'='*60}")
+            answer = self._input_with_timeout(
+                "  복구 방법 선택 (y=포지션복구 / s=즉시청산 / n=무시, 30초 대기): ",
+                timeout=30.0,
+                default="n",
+            )
+
+            if answer == "y":
+                # 포지션 상태 복구
+                self.state = STATE_POSITION
+                self.current_market = market
+                self.entry_price = entry_price
+                self.coin_qty = coin_qty
+                self.highest_price = state_data.get("highest_price", entry_price)
+                if self.config.PAPER_TRADING:
+                    self.paper_capital = state_data.get("paper_capital", self.paper_capital)
+                # TP/SL 매도 주문 복원
+                if tp_price:
+                    self.order_mgr.place_limit_sell(market, tp_price, coin_qty, "tp")
+                if sl_price:
+                    self.order_mgr.place_limit_sell(market, sl_price, coin_qty, "sl")
+                self.adjust_counter = 0
+                logger.info(f"포지션 복구 완료: {market} @ {fmt_price(entry_price)}")
+                print(f"  ✅ 포지션 복구 완료 — 모니터링 재개")
+
+            elif answer == "s":
+                # 즉시 시장가 청산
+                print("  📤 즉시 시장가 청산 실행 중...")
+                self.current_market = market
+                self.entry_price = entry_price
+                self.coin_qty = coin_qty
+                current = self.client.get_current_price(market)
+                if current and coin_qty > 0:
+                    order = self.client.sell_market_order(market, coin_qty)
+                    if order:
+                        exit_price = order.get("price", current)
+                        fee = order.get("fee", 0.0)
+                        if self.config.PAPER_TRADING:
+                            self.paper_capital += order.get(
+                                "revenue", coin_qty * current
+                            )
+                        self._record_sell(exit_price, fee, "재시작 후 즉시 청산")
+                        return  # _record_sell 내부에서 _clear_state() 호출됨
+                self._clear_state()
+
+            else:
+                print("  상태 파일 무시 — IDLE 상태로 시작합니다.")
+                print("  ⚠️ 업비트 앱에서 미체결 주문을 직접 확인하세요.")
+                self._clear_state()
+
+        elif saved_state == STATE_BUY_WAITING:
+            print(f"{'='*60}")
+            print("  매수 주문 대기 중이었습니다.")
+            print("  ⚠️ 업비트 앱에서 미체결 매수 주문을 직접 확인/취소하세요.")
+            self._input_with_timeout("  확인 후 Enter (30초 대기): ", timeout=30.0, default="")
+            self._clear_state()
+
+        else:
+            self._clear_state()
+
+    def _emergency_shutdown(self):
+        """atexit 등 예상치 못한 종료 시 포지션 정보를 파일에 저장합니다."""
+        if self.state in (STATE_POSITION, STATE_BUY_WAITING):
+            logger.warning(
+                f"예상치 못한 종료 감지 (상태={self.state}) → 상태 파일 저장"
+            )
+            self._save_state()
+
+    # ──────────────────────────────────────────
 
     @staticmethod
     def _input_with_timeout(prompt: str, timeout: float = 30.0, default: str = "n") -> str:
