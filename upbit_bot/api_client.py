@@ -131,7 +131,27 @@ class UpbitClient:
         try:
             order = self.upbit.sell_market_order(market, coin_qty)
             logger.info(f"[LIVE] 시장가 매도 주문: {order}")
-            return order
+            # 업비트 API 응답 필드를 paper trading 반환값과 동일한 구조로 정규화
+            if order is not None:
+                current_price = self.get_current_price(market) or 0.0
+                exec_price = float(
+                    order.get("price") or order.get("avg_price") or current_price
+                )
+                exec_volume = float(
+                    order.get("executed_volume") or order.get("volume") or coin_qty
+                )
+                revenue = exec_price * exec_volume
+                fee = float(order.get("paid_fee") or order.get("fee") or revenue * 0.0005)
+                return {
+                    "type": "live_sell",
+                    "market": market,
+                    "price": exec_price,
+                    "coin_qty": exec_volume,
+                    "revenue": revenue - fee,
+                    "fee": fee,
+                    "_raw": order,
+                }
+            return None
         except Exception as e:
             logger.error(f"매도 주문 오류: {e}")
             return None

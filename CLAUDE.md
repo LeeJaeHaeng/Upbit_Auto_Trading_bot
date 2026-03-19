@@ -140,3 +140,57 @@ Django port: 8001, Streamlit port: 8501 (auto-increments if occupied). PIDs trac
 - `bot.log` — bot activity log (file + console)
 - `trades_YYYYMMDD.csv` — trade history
 - `performance.json` — cumulative performance metrics
+
+---
+
+## 실거래 전 체크리스트 (Pre-Live Checklist)
+
+실거래(`--live`) 전 반드시 확인해야 할 사항입니다.
+
+### 필수 준비
+
+- [ ] `.env` 파일에 실제 API 키 입력 (`UPBIT_ACCESS_KEY`, `UPBIT_SECRET_KEY`)
+- [ ] 업비트 오픈API에서 출금/주문 권한 활성화 여부 확인
+- [ ] `PAPER_TRADING = True` 기본값 유지 — 실거래 시 `--live` 플래그 사용
+- [ ] 충분한 KRW 잔고 확인 (`TRADE_AMOUNT_KRW` = 100,000원 기준)
+- [ ] 페이퍼 트레이딩으로 최소 1주일 이상 검증 완료
+
+### 알려진 제한사항
+
+| 항목 | 내용 | 조치 |
+| --- | --- | --- |
+| 단일 포지션 | 한 번에 1개 마켓만 포지션 보유 가능 | 의도된 설계 |
+| 지정가 체결 시뮬레이션 | 페이퍼 트레이딩에서 현재가 ≤ 주문가이면 즉시 체결 처리 (호가 깊이 무시) | 실거래 전환 시 체결률 차이 발생 가능 |
+| 국면 필터 EMA200 | 60개 미만 캔들 시 실거래 모드에서는 진입 차단(안전), 페이퍼에서는 스킵 | 의도된 비대칭 설계 |
+| API 레이트 리밋 | pyupbit 내부에서 초당 10회 제한. 빠른 사이클(< 10초) 설정 시 오류 가능 | `CHECK_INTERVAL` 최소 30초 권장 |
+| 거래량 없는 알트코인 | 스캐너 최소 거래량 필터(50B) 있으나 급격한 거래량 감소 시 슬리피지 큼 | 현재 무대응 |
+
+### 운영 주의사항
+
+- **강제청산 타임아웃**: 봇 종료(Ctrl+C) 시 포지션 보유 중이면 30초 내 응답 없으면 자동으로 기존 지정가 주문 유지(n 기본값)
+- **중복 주문 방지**: `place_limit_buy()` 시작 시 `active_buy_order` 존재 여부 확인 — 비정상 종료 후 재시작 시 잔여 주문이 업비트에 남아 있을 수 있으므로 업비트 앱에서 미체결 주문 직접 확인 필요
+- **동적 TP/SL 조정 race condition**: update_exit_prices() 호출 직전 체결 여부 재확인 로직 존재. 그러나 네트워크 지연 상황에서는 체결 감지 누락 가능 — 업비트 앱 병행 모니터링 권장
+- **수수료 계산**: 페이퍼 트레이딩에서 매수 시 `trade_amount + fee` 차감. 실거래에서는 업비트 KRW 잔고에서 실시간 차감되므로 잔고 부족 시 주문 실패
+- **전략 한계**: 현재 전략은 단방향(롱 전용). BTC -20% 이상 하락장에서는 국면 필터가 진입을 막아주나, 급격한 플래시 크래시에서는 손절 슬리피지 발생 가능
+
+### config.py 주요 파라미터 (최적화 반영: 2026-03-19)
+
+| 파라미터 | 값 | 설명 |
+| --- | --- | --- |
+| `RSI_OVERSOLD` | 25 | 과매도 기준 — 이 값 **그대로** RSI 신호 판정 (이전 +5 버그 수정 완료) |
+| `STOP_LOSS_PCT` | 0.020 | 손절 2.0% |
+| `TAKE_PROFIT_PCT` | 0.030 | 익절 3.0% |
+| `TRAILING_STOP_PCT` | 0.010 | 트레일링 스탑 1.0% |
+| `USE_TREND_FILTER` | True | EMA200 하락장 필터 활성화 |
+| `TREND_FILTER_STRICT` | False | strict=False: close < EMA200 AND ema50 < EMA200 모두 충족 시만 차단 |
+
+### 수정된 버그 목록 (2026-03-19)
+
+1. **`indicators.py`** — `get_signal_score()`: RSI 신호 조건이 `config.RSI_OVERSOLD + 5` 하드코딩 → `config.RSI_OVERSOLD` 직접 사용으로 수정
+2. **`order_manager.py`** — `place_limit_buy()`: 활성 매수 주문 존재 시 중복 방지 로직 추가
+3. **`order_manager.py`** — `check_sell_orders()`: Exception 무시 → 재시도 1회 + 에러 로깅
+4. **`api_client.py`** — `sell_market_order()`: 실거래 API 응답 필드 부재 시 추정값으로 정규화 (price, fee, revenue 보장)
+5. **`trader.py`** — `_check_trend_filter()`: 실거래 모드에서 캔들 데이터 부족 시 안전 차단
+6. **`trader.py`** — `_on_buy_filled()`: paper_capital 차감 시 수수료 미포함 버그 수정
+7. **`trader.py`** — `_dynamic_adjust_exit()`: update_exit_prices() 직전 race condition 방지용 체결 재확인
+8. **`trader.py`** — `_shutdown()`: input() 무한 대기 → 30초 타임아웃 (threading 기반)

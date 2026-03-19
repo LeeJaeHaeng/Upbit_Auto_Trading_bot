@@ -128,10 +128,10 @@ def get_signal_score(row: pd.Series, config) -> dict:
     details = {}
 
     # ── 1. RSI 신호 ──
-    # RSI가 과매도(30 이하)에서 반등 중이면 매수 신호
+    # RSI가 과매도 기준 이하이면 매수 신호
     rsi = row["rsi"]
-    signals["rsi"] = rsi < config.RSI_OVERSOLD + 5  # 35 이하면 신호
-    details["rsi"] = f"RSI={rsi:.1f} (기준≤{config.RSI_OVERSOLD + 5})"
+    signals["rsi"] = rsi < config.RSI_OVERSOLD
+    details["rsi"] = f"RSI={rsi:.1f} (기준≤{config.RSI_OVERSOLD})"
 
     # ── 2. MACD 신호 ──
     # MACD 히스토그램이 음수에서 양수로 전환되거나,

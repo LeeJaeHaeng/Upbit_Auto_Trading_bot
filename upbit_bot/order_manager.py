@@ -253,6 +253,14 @@ class OrderManager:
         """
         지정가 매수 주문을 설정합니다.
         """
+        # 이미 활성 매수 주문이 있으면 중복 방지
+        if self.active_buy_order is not None:
+            logger.warning(
+                f"이미 활성 매수 주문 존재 (uuid={self.active_buy_order.get('uuid')}) "
+                f"— 새 주문 생성 건너뜀"
+            )
+            return None
+
         coin_qty = amount_krw / price
         fee = amount_krw * self.config.FEE_RATE
 
@@ -408,17 +416,27 @@ class OrderManager:
                 return {"filled": True, "type": "sl", "price": self.active_sl_order["price"]}
             return {"filled": False, "type": None, "price": current_price}
 
-        # 실거래: 주문 상태 조회
+        # 실거래: 주문 상태 조회 (오류 발생 시 재시도 1회)
         for order_type, order in [("tp", self.active_tp_order), ("sl", self.active_sl_order)]:
             if order is None:
                 continue
-            try:
-                result = self.client.upbit.get_order(order["uuid"])
-                if result and result.get("state") == "done":
-                    order["status"] = "done"
-                    return {"filled": True, "type": order_type, "price": order["price"]}
-            except Exception:
-                continue
+            for attempt in range(2):
+                try:
+                    result = self.client.upbit.get_order(order["uuid"])
+                    if result and result.get("state") == "done":
+                        order["status"] = "done"
+                        return {"filled": True, "type": order_type, "price": order["price"]}
+                    break  # 성공했으면 재시도 불필요
+                except Exception as e:
+                    if attempt == 0:
+                        logger.warning(
+                            f"매도 주문 상태 조회 오류 ({order_type}, attempt {attempt+1}): {e} — 재시도"
+                        )
+                        time.sleep(0.5)
+                    else:
+                        logger.error(
+                            f"매도 주문 상태 조회 재시도 실패 ({order_type}): {e}"
+                        )
 
         return {"filled": False, "type": None, "price": current_price}
 

@@ -12,6 +12,7 @@
 
 import time
 import logging
+import threading
 from datetime import datetime
 from typing import Any
 
@@ -134,7 +135,10 @@ class Trader:
                 count=220,
             )
             if df is None or len(df) < 60:
-                return {"allowed": True, "regime": "unknown", "reason": "데이터 부족 — 필터 스킵"}
+                if not getattr(self.config, "PAPER_TRADING", True):
+                    # 실거래 모드: 데이터 부족 시 안전하게 차단
+                    return {"allowed": False, "regime": "unknown", "reason": "데이터 부족 — 실거래 안전 차단"}
+                return {"allowed": True, "regime": "unknown", "reason": "데이터 부족 — 필터 스킵 (페이퍼)"}
 
             df.columns = ["open", "high", "low", "close", "volume", "value"]
             closes = df["close"]
@@ -299,7 +303,8 @@ class Trader:
 
         fee = order["fee"]
         if self.config.PAPER_TRADING:
-            self.paper_capital -= self._pending_trade_amount
+            # 매수금액 + 수수료를 함께 차감 (실거래 시뮬레이션)
+            self.paper_capital -= (self._pending_trade_amount + fee)
 
         # 신호 점수 기록
         df = pyupbit.get_ohlcv(
@@ -414,6 +419,11 @@ class Trader:
                     )
                     new_tp = self.order_mgr._round_to_tick(new_tp, current_price)
 
+                    # 주문 취소-재설정 전 마지막 체결 확인 (race condition 방지)
+                    pre_check = self.order_mgr.check_sell_orders(market)
+                    if pre_check["filled"]:
+                        self._on_sell_filled(pre_check)
+                        return
                     self.order_mgr.update_exit_prices(
                         market, new_tp, new_sl, self.coin_qty
                     )
@@ -489,6 +499,25 @@ class Trader:
 
         self.trade_logger.print_summary()
 
+    @staticmethod
+    def _input_with_timeout(prompt: str, timeout: float = 30.0, default: str = "n") -> str:
+        """타임아웃이 있는 input(). timeout초 내 응답 없으면 default를 반환합니다."""
+        result = [default]
+        answered = threading.Event()
+
+        def _read():
+            try:
+                result[0] = input(prompt).strip().lower()
+            except Exception:
+                pass
+            answered.set()
+
+        t = threading.Thread(target=_read, daemon=True)
+        t.start()
+        if not answered.wait(timeout):
+            print(f"\n  ⏱️ {timeout:.0f}초 내 응답 없음 → 기본값 '{default}' 적용")
+        return result[0]
+
     def _shutdown(self):
         """봇 종료 처리"""
         if self.state == STATE_BUY_WAITING:
@@ -498,7 +527,7 @@ class Trader:
 
         elif self.state == STATE_POSITION:
             print("  ⚠️ 미청산 포지션 존재. 강제 청산하시겠습니까?")
-            answer = input("강제 청산 (y/n): ").strip().lower()
+            answer = self._input_with_timeout("강제 청산 (y/n, 30초 내 응답): ", timeout=30.0, default="n")
             if answer == "y":
                 if self.current_market is None:
                     logger.warning("강제청산 중 current_market이 None -> 청산 생략")
