@@ -1,0 +1,245 @@
+{% extends "dashboard/base.html" %}
+{% block title %}대시보드 - 성과 요약{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <h2><i class="bi bi-speedometer2"></i> 대시보드</h2>
+  <button class="btn btn-sm btn-outline-secondary" onclick="location.reload()">
+    <i class="bi bi-arrow-clockwise"></i> 새로고침
+  </button>
+</div>
+
+<!-- KPI 카드 -->
+<div class="row g-3 mb-4">
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">총 거래</div>
+      <div class="value">{{ overview.total_trades }}회</div>
+      <div class="delta text-muted">{{ overview.win_count }}승 {{ overview.loss_count }}패</div>
+    </div>
+  </div>
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">승률</div>
+      <div class="value">{{ overview.win_rate }}%</div>
+      <div class="delta" style="color:var(--accent);">프로핏 팩터 {{ overview.profit_factor }}</div>
+    </div>
+  </div>
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">순손익</div>
+      <div class="value {% if overview.total_pnl >= 0 %}text-profit{% else %}text-loss{% endif %}">
+        {% if overview.total_pnl >= 0 %}+{% endif %}{{ overview.total_pnl|floatformat:0 }}원
+      </div>
+      <div class="delta {% if overview.total_return >= 0 %}text-profit{% else %}text-loss{% endif %}">
+        {% if overview.total_return >= 0 %}+{% endif %}{{ overview.total_return }}%
+      </div>
+    </div>
+  </div>
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">현재 자금</div>
+      <div class="value">{{ overview.current_capital|floatformat:0 }}원</div>
+      <div class="delta text-muted">시작 {{ overview.initial_capital|floatformat:0 }}원</div>
+    </div>
+  </div>
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">MDD</div>
+      <div class="value text-loss">{{ overview.mdd|floatformat:0 }}원</div>
+      <div class="delta text-muted">수수료 {{ overview.total_fees|floatformat:0 }}원</div>
+    </div>
+  </div>
+</div>
+
+<!-- 차트 -->
+<div class="row g-3 mb-4">
+  <div class="col-lg-8">
+    <div class="card-dark">
+      <h5><i class="bi bi-graph-up-arrow"></i> 누적 수익 곡선</h5>
+      <canvas id="cumulativeChart" height="90"></canvas>
+    </div>
+  </div>
+  <div class="col-lg-4">
+    <div class="card-dark">
+      <h5><i class="bi bi-bar-chart"></i> 거래별 손익</h5>
+      <canvas id="pnlChart" height="200"></canvas>
+    </div>
+  </div>
+</div>
+
+<!-- 기간별 분석 탭 -->
+<div class="card-dark">
+  <ul class="nav nav-pills mb-3" role="tablist">
+    <li class="nav-item"><a class="nav-link active" data-bs-toggle="pill" href="#daily">일별</a></li>
+    <li class="nav-item"><a class="nav-link" data-bs-toggle="pill" href="#weekly">주별</a></li>
+    <li class="nav-item"><a class="nav-link" data-bs-toggle="pill" href="#monthly">월별</a></li>
+    <li class="nav-item"><a class="nav-link" data-bs-toggle="pill" href="#by-market">코인별</a></li>
+  </ul>
+  <div class="tab-content">
+
+    <!-- 일별 -->
+    <div class="tab-pane fade show active" id="daily">
+      {% if daily %}
+      <div class="table-responsive">
+        <table class="table table-dark-custom">
+          <thead><tr><th>날짜</th><th>거래수</th><th>총손익</th><th>평균손익</th><th>승률</th></tr></thead>
+          <tbody>
+          {% for d in daily reversed %}
+          <tr>
+            <td>{{ d.date }}</td>
+            <td>{{ d.trades }}회</td>
+            <td class="{% if d.pnl >= 0 %}text-profit{% else %}text-loss{% endif %}">
+              {% if d.pnl >= 0 %}+{% endif %}{{ d.pnl|floatformat:0 }}원</td>
+            <td>{% if d.avg_pnl >= 0 %}+{% endif %}{{ d.avg_pnl|floatformat:0 }}원</td>
+            <td>{{ d.win_rate }}%</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}<p class="text-muted">거래 데이터 없음</p>{% endif %}
+    </div>
+
+    <!-- 주별 -->
+    <div class="tab-pane fade" id="weekly">
+      {% if weekly %}
+      <div class="table-responsive">
+        <table class="table table-dark-custom">
+          <thead><tr><th>주차</th><th>거래수</th><th>총손익</th><th>승률</th></tr></thead>
+          <tbody>
+          {% for w in weekly reversed %}
+          <tr>
+            <td>{{ w.week }}</td>
+            <td>{{ w.trades }}회</td>
+            <td class="{% if w.pnl >= 0 %}text-profit{% else %}text-loss{% endif %}">
+              {% if w.pnl >= 0 %}+{% endif %}{{ w.pnl|floatformat:0 }}원</td>
+            <td>{{ w.win_rate }}%</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}<p class="text-muted">거래 데이터 없음</p>{% endif %}
+    </div>
+
+    <!-- 월별 -->
+    <div class="tab-pane fade" id="monthly">
+      {% if monthly %}
+      <div class="table-responsive">
+        <table class="table table-dark-custom">
+          <thead><tr><th>월</th><th>거래수</th><th>총손익</th><th>승률</th></tr></thead>
+          <tbody>
+          {% for m in monthly reversed %}
+          <tr>
+            <td>{{ m.month }}</td>
+            <td>{{ m.trades }}회</td>
+            <td class="{% if m.pnl >= 0 %}text-profit{% else %}text-loss{% endif %}">
+              {% if m.pnl >= 0 %}+{% endif %}{{ m.pnl|floatformat:0 }}원</td>
+            <td>{{ m.win_rate }}%</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}<p class="text-muted">거래 데이터 없음</p>{% endif %}
+    </div>
+
+    <!-- 코인별 -->
+    <div class="tab-pane fade" id="by-market">
+      {% if market_perf %}
+      <div class="table-responsive">
+        <table class="table table-dark-custom">
+          <thead><tr><th>코인</th><th>거래수</th><th>총손익</th><th>평균(%)</th><th>승률</th></tr></thead>
+          <tbody>
+          {% for mp in market_perf %}
+          <tr>
+            <td><strong>{{ mp.market }}</strong></td>
+            <td>{{ mp.trades }}회</td>
+            <td class="{% if mp.pnl >= 0 %}text-profit{% else %}text-loss{% endif %}">
+              {% if mp.pnl >= 0 %}+{% endif %}{{ mp.pnl|floatformat:0 }}원</td>
+            <td>{{ mp.avg_pnl_pct }}%</td>
+            <td>{{ mp.win_rate }}%</td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% else %}<p class="text-muted">거래 데이터 없음</p>{% endif %}
+    </div>
+
+  </div>
+</div>
+
+<!-- 리스크 지표 카드 -->
+<div class="row g-3 mt-2">
+  <div class="col-md-4">
+    <div class="card-dark">
+      <h5>수익 거래</h5>
+      <div class="d-flex justify-content-between"><span class="text-muted">평균</span><span class="text-profit">+{{ overview.avg_win }}%</span></div>
+      <div class="d-flex justify-content-between"><span class="text-muted">최대</span><span class="text-profit">+{{ overview.max_win }}%</span></div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card-dark">
+      <h5>손실 거래</h5>
+      <div class="d-flex justify-content-between"><span class="text-muted">평균</span><span class="text-loss">{{ overview.avg_loss }}%</span></div>
+      <div class="d-flex justify-content-between"><span class="text-muted">최대</span><span class="text-loss">{{ overview.max_loss }}%</span></div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card-dark">
+      <h5>리스크 비율</h5>
+      <div class="d-flex justify-content-between"><span class="text-muted">프로핏 팩터</span><span>{{ overview.profit_factor }}</span></div>
+      <div class="d-flex justify-content-between"><span class="text-muted">MDD</span><span class="text-loss">{{ overview.mdd|floatformat:0 }}원</span></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const cumData = JSON.parse('{{ cumulative|default:"[]"|escapejs }}');
+const ctx1 = document.getElementById('cumulativeChart');
+if (cumData.length > 0) {
+  new Chart(ctx1, {
+    type: 'line',
+    data: {
+      labels: cumData.map(d => d.timestamp.substring(5, 16)),
+      datasets: [{
+        label: '누적 손익 (원)',
+        data: cumData.map(d => d.cumulative),
+        borderColor: '#6366f1',
+        backgroundColor: 'rgba(99,102,241,.1)',
+        fill: true, tension: .3, pointRadius: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: { x: { display: false }, y: { grid: { color: 'rgba(255,255,255,.05)' } } }
+    }
+  });
+}
+
+const ctx2 = document.getElementById('pnlChart');
+if (cumData.length > 0) {
+  new Chart(ctx2, {
+    type: 'bar',
+    data: {
+      labels: cumData.map(d => d.timestamp.substring(5, 16)),
+      datasets: [{
+        label: '손익 (원)',
+        data: cumData.map(d => d.pnl),
+        backgroundColor: cumData.map(d => d.pnl >= 0 ? 'rgba(34,197,94,.6)' : 'rgba(239,68,68,.6)'),
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: { x: { display: false }, y: { grid: { color: 'rgba(255,255,255,.05)' } } }
+    }
+  });
+}
+</script>
+{% endblock %}

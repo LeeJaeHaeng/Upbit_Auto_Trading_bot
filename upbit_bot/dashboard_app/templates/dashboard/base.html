@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="ko" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}자동매매 대시보드{% endblock %}</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --accent: #6366f1;
+      --green: #22c55e;
+      --red: #ef4444;
+      --bg-card: #1e1e2e;
+      --bg-body: #11111b;
+      --text-dim: #94a3b8;
+    }
+    body { background: var(--bg-body); font-family: 'Segoe UI', system-ui, sans-serif; }
+    .sidebar {
+      position: fixed; top: 0; left: 0; width: 240px; height: 100vh;
+      background: var(--bg-card); border-right: 1px solid #2e2e3e;
+      padding: 1.5rem 1rem; z-index: 100;
+    }
+    .sidebar .logo { font-size: 1.3rem; font-weight: 700; color: var(--accent); margin-bottom: 2rem; }
+    .sidebar .nav-link {
+      color: var(--text-dim); padding: .65rem 1rem; border-radius: 8px;
+      margin-bottom: 4px; transition: all .15s;
+    }
+    .sidebar .nav-link:hover, .sidebar .nav-link.active {
+      background: rgba(99,102,241,.15); color: #fff;
+    }
+    .sidebar .nav-link i { margin-right: 10px; width: 20px; text-align: center; }
+    .main-content { margin-left: 240px; padding: 1.5rem 2rem; min-height: 100vh; }
+    .kpi-card {
+      background: var(--bg-card); border-radius: 12px; padding: 1.25rem 1.5rem;
+      border: 1px solid #2e2e3e; transition: transform .15s;
+    }
+    .kpi-card:hover { transform: translateY(-2px); }
+    .kpi-card .label { font-size: .8rem; color: var(--text-dim); text-transform: uppercase; letter-spacing: .5px; }
+    .kpi-card .value { font-size: 1.6rem; font-weight: 700; margin-top: 4px; }
+    .kpi-card .delta { font-size: .85rem; margin-top: 2px; }
+    .text-profit { color: var(--green); }
+    .text-loss { color: var(--red); }
+    .card-dark {
+      background: var(--bg-card); border-radius: 12px; border: 1px solid #2e2e3e;
+      padding: 1.25rem; margin-bottom: 1.5rem;
+    }
+    .card-dark h5 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; color: #e2e8f0; }
+    .table-dark-custom { background: transparent; }
+    .table-dark-custom th {
+      font-size: .75rem; text-transform: uppercase; color: var(--text-dim);
+      border-bottom: 1px solid #2e2e3e; padding: .75rem .5rem;
+    }
+    .table-dark-custom td {
+      padding: .65rem .5rem; border-bottom: 1px solid rgba(46,46,62,.5);
+      font-size: .9rem; vertical-align: middle;
+    }
+    .badge-signal {
+      padding: 4px 10px; border-radius: 20px; font-size: .75rem; font-weight: 600;
+    }
+    .badge-on { background: rgba(34,197,94,.15); color: var(--green); }
+    .badge-off { background: rgba(239,68,68,.1); color: var(--red); }
+    .env-indicator {
+      display: flex; align-items: center; padding: .6rem 0;
+      border-bottom: 1px solid rgba(46,46,62,.3);
+    }
+    .env-indicator:last-child { border-bottom: none; }
+    .env-dot { width: 10px; height: 10px; border-radius: 50%; margin-right: 10px; flex-shrink: 0; }
+    .dot-green { background: var(--green); }
+    .dot-yellow { background: #eab308; }
+    .dot-red { background: var(--red); }
+    .page-header { margin-bottom: 1.5rem; }
+    .page-header h2 { font-size: 1.5rem; font-weight: 700; }
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .main-content { margin-left: 0; padding: 1rem; }
+    }
+  </style>
+  {% block extra_css %}{% endblock %}
+</head>
+<body>
+  <!-- 사이드바 -->
+  <nav class="sidebar">
+    <div class="logo"><i class="bi bi-robot"></i> 자동매매 봇</div>
+    <ul class="nav flex-column">
+      <li><a href="{% url 'overview' %}" class="nav-link {% if request.resolver_match.url_name == 'overview' %}active{% endif %}">
+        <i class="bi bi-speedometer2"></i> 대시보드</a></li>
+      <li><a href="{% url 'chart' %}" class="nav-link {% if request.resolver_match.url_name == 'chart' %}active{% endif %}">
+        <i class="bi bi-graph-up"></i> 실시간 차트</a></li>
+      <li><a href="{% url 'trades' %}" class="nav-link {% if request.resolver_match.url_name == 'trades' %}active{% endif %}">
+        <i class="bi bi-list-check"></i> 거래 내역</a></li>
+    </ul>
+    <div style="position:absolute;bottom:1.5rem;left:1rem;right:1rem;">
+      <div style="font-size:.7rem;color:var(--text-dim);">
+        <i class="bi bi-circle-fill text-success" style="font-size:6px;"></i> 봇 실행 중<br>
+        <span id="clock"></span>
+      </div>
+    </div>
+  </nav>
+
+  <!-- 메인 -->
+  <div class="main-content">
+    {% block content %}{% endblock %}
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script>
+    // 시계
+    function updateClock(){
+      document.getElementById('clock').textContent = new Date().toLocaleString('ko-KR');
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+  </script>
+  {% block extra_js %}{% endblock %}
+</body>
+</html>

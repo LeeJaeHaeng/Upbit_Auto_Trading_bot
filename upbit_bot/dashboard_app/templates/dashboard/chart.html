@@ -1,0 +1,425 @@
+{% extends "dashboard/base.html" %}
+{% block title %}실시간 차트{% endblock %}
+
+{% block content %}
+<div class="page-header d-flex justify-content-between align-items-center">
+  <h2><i class="bi bi-graph-up-arrow"></i> 실시간 차트</h2>
+  <form method="get" class="d-flex gap-2">
+    <select class="form-select form-select-sm" name="market" id="marketSelect" style="min-width: 170px;">
+      {% for m in markets %}
+      <option value="{{ m }}" {% if m == market %}selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+    <select class="form-select form-select-sm" name="unit" id="unitSelect" style="min-width: 110px;">
+      {% for u in units %}
+      <option value="{{ u }}" {% if u == unit %}selected{% endif %}>
+        {% if u == 240 %}4시간봉{% else %}{{ u }}분봉{% endif %}
+      </option>
+      {% endfor %}
+    </select>
+    <button class="btn btn-sm btn-outline-secondary" type="submit">
+      <i class="bi bi-arrow-repeat"></i> 조회
+    </button>
+  </form>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">현재가</div>
+      <div class="value" id="kpiPrice">-</div>
+      <div class="delta text-muted" id="kpiMarket">-</div>
+    </div>
+  </div>
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">신호 점수</div>
+      <div class="value" id="kpiSignal">-</div>
+      <div class="delta text-muted">최대 5점</div>
+    </div>
+  </div>
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">RSI</div>
+      <div class="value" id="kpiRsi">-</div>
+      <div class="delta text-muted">과매도 30 / 과매수 70</div>
+    </div>
+  </div>
+  <div class="col-md col-6">
+    <div class="kpi-card">
+      <div class="label">시장 환경</div>
+      <div class="value" id="kpiEnvScore">-</div>
+      <div class="delta text-muted" id="kpiEnvText">-</div>
+    </div>
+  </div>
+</div>
+
+<div class="card-dark">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <h5 class="mb-0">가격 캔들 + 거래량 + EMA</h5>
+    <div class="btn-group btn-group-sm" role="group" aria-label="zoom-controls">
+      <button type="button" class="btn btn-outline-secondary" id="priceZoomIn">확대</button>
+      <button type="button" class="btn btn-outline-secondary" id="priceZoomOut">축소</button>
+      <button type="button" class="btn btn-outline-secondary" id="priceZoomReset">리셋</button>
+    </div>
+  </div>
+  <div style="height: 520px;">
+    <canvas id="priceChart"></canvas>
+  </div>
+  <div class="mt-2" style="height: 150px;">
+    <canvas id="volumeChart"></canvas>
+  </div>
+  <div id="priceChartNotice" class="text-muted mt-2 d-none"></div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card-dark">
+      <h5>RSI</h5>
+      <canvas id="rsiChart" height="140"></canvas>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="card-dark">
+      <h5>MACD</h5>
+      <canvas id="macdChart" height="140"></canvas>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1/dist/chartjs-plugin-zoom.min.js"></script>
+<script>
+const market = "{{ market }}";
+const unit = "{{ unit }}";
+
+let priceChart = null;
+let volumeChart = null;
+let rsiChart = null;
+let macdChart = null;
+let zoomPluginRegistered = false;
+const KRW_FORMATTER = new Intl.NumberFormat("ko-KR", { maximumFractionDigits: 0 });
+
+function formatNumber(v) {
+  return Number(v).toLocaleString("ko-KR", { maximumFractionDigits: 2 });
+}
+
+function formatKrw(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "-";
+  return KRW_FORMATTER.format(Math.round(n));
+}
+
+function destroyChart(chart) {
+  if (chart) chart.destroy();
+}
+
+function setKpiText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function setPriceNotice(text) {
+  const el = document.getElementById("priceChartNotice");
+  if (!el) return;
+  if (text) {
+    el.classList.remove("d-none");
+    el.textContent = text;
+  } else {
+    el.classList.add("d-none");
+    el.textContent = "";
+  }
+}
+
+function registerZoomPluginIfNeeded() {
+  if (zoomPluginRegistered || typeof Chart === "undefined") return;
+  const plugin = window.ChartZoom;
+  if (plugin && typeof Chart.register === "function") {
+    Chart.register(plugin);
+    zoomPluginRegistered = true;
+  }
+}
+
+function bindPriceZoomControls() {
+  const zoomInBtn = document.getElementById("priceZoomIn");
+  const zoomOutBtn = document.getElementById("priceZoomOut");
+  const zoomResetBtn = document.getElementById("priceZoomReset");
+  const enabled = !!(priceChart && typeof priceChart.zoom === "function");
+
+  [zoomInBtn, zoomOutBtn, zoomResetBtn].forEach((btn) => {
+    if (btn) btn.disabled = !enabled;
+  });
+
+  if (!enabled) return;
+  if (zoomInBtn) zoomInBtn.onclick = () => priceChart.zoom(1.2);
+  if (zoomOutBtn) zoomOutBtn.onclick = () => priceChart.zoom(0.8);
+  if (zoomResetBtn) zoomResetBtn.onclick = () => priceChart.resetZoom();
+}
+
+function renderPriceCandles(data) {
+  if (typeof Chart === "undefined") {
+    setPriceNotice("차트 라이브러리를 불러오지 못했습니다.");
+    return;
+  }
+  registerZoomPluginIfNeeded();
+
+  const candles = data.candles || [];
+  if (!candles.length) {
+    destroyChart(priceChart);
+    destroyChart(volumeChart);
+    setPriceNotice("업비트 캔들 데이터를 불러오지 못했습니다. (네트워크/API 상태 확인)");
+    return;
+  }
+
+  setPriceNotice("");
+
+  const labels = data.labels && data.labels.length === candles.length
+    ? data.labels
+    : candles.map((c) => new Date(c.time * 1000).toLocaleString("ko-KR"));
+
+  const candleColors = candles.map((c) =>
+    c.close >= c.open ? "rgba(239,68,68,0.95)" : "rgba(59,130,246,0.95)"
+  );
+  const bodyData = candles.map((c) => [c.open, c.close]);
+  const wickData = candles.map((c) => [c.low, c.high]);
+  const volumeData = (data.volume_bars || []).map((v) => v.value);
+
+  destroyChart(priceChart);
+  priceChart = new Chart(document.getElementById("priceChart"), {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          type: "bar",
+          label: "고저",
+          data: wickData,
+          grouped: false,
+          yAxisID: "y",
+          backgroundColor: candleColors,
+          borderColor: candleColors,
+          borderWidth: 0,
+          barThickness: 2,
+          borderSkipped: false,
+          order: 1,
+        },
+        {
+          type: "bar",
+          label: "캔들",
+          data: bodyData,
+          grouped: false,
+          yAxisID: "y",
+          backgroundColor: candleColors,
+          borderColor: candleColors,
+          borderWidth: 1,
+          barThickness: 7,
+          borderSkipped: false,
+          order: 2,
+        },
+        {
+          type: "line",
+          label: "EMA 단기",
+          data: data.ema_short || [],
+          yAxisID: "y",
+          borderColor: "#f59e0b",
+          pointRadius: 0,
+          tension: 0.18,
+          borderWidth: 2,
+          order: 0,
+        },
+        {
+          type: "line",
+          label: "EMA 장기",
+          data: data.ema_long || [],
+          yAxisID: "y",
+          borderColor: "#a78bfa",
+          pointRadius: 0,
+          tension: 0.18,
+          borderWidth: 2,
+          order: 0,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: {
+          labels: {
+            color: "#cbd5e1",
+            filter: (item) => item.text !== "고저",
+          },
+        },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const raw = ctx.raw;
+              const name = ctx.dataset.label || "";
+              if (name === "고저" && Array.isArray(raw)) {
+                return `${name}: ${formatKrw(raw[0])} ~ ${formatKrw(raw[1])}`;
+              }
+              if (name === "캔들" && Array.isArray(raw)) {
+                return `${name}: ${formatKrw(raw[0])} ~ ${formatKrw(raw[1])}`;
+              }
+              return `${name}: ${formatKrw(raw)}`;
+            },
+          },
+        },
+        zoom: zoomPluginRegistered ? {
+          pan: {
+            enabled: true,
+            mode: "x",
+            modifierKey: "shift",
+          },
+          zoom: {
+            wheel: { enabled: true },
+            pinch: { enabled: true },
+            mode: "x",
+          },
+        } : undefined,
+      },
+      scales: {
+        x: { display: false, grid: { color: "rgba(255,255,255,.04)" } },
+        y: {
+          position: "right",
+          beginAtZero: false,
+          grace: "2%",
+          grid: { color: "rgba(255,255,255,.06)" },
+          ticks: {
+            color: "#cbd5e1",
+            callback: (v) => formatKrw(v),
+          },
+        },
+      },
+    },
+  });
+
+  destroyChart(volumeChart);
+  volumeChart = new Chart(document.getElementById("volumeChart"), {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "거래량",
+          data: volumeData,
+          backgroundColor: candleColors.map((c) => c.replace("0.95", "0.5")),
+          borderWidth: 0,
+          barThickness: 7,
+        },
+      ],
+    },
+    options: {
+      maintainAspectRatio: false,
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `거래량: ${formatKrw(ctx.raw)}`,
+          },
+        },
+      },
+      scales: {
+        x: { display: false, grid: { color: "rgba(255,255,255,.04)" } },
+        y: {
+          position: "right",
+          grid: { color: "rgba(255,255,255,.06)" },
+          ticks: {
+            color: "#94a3b8",
+            callback: (v) => formatKrw(v),
+          },
+        },
+      },
+    },
+  });
+
+  bindPriceZoomControls();
+}
+
+async function loadChartData() {
+  try {
+    const res = await fetch(`/api/chart/${market}/${unit}/`);
+    if (!res.ok) throw new Error("chart api failed");
+    const data = await res.json();
+    if (!data || !data.labels || data.labels.length === 0) {
+      setPriceNotice("업비트 캔들 데이터를 불러오지 못했습니다. (네트워크/API 상태 확인)");
+      return;
+    }
+
+    setKpiText("kpiPrice", `${formatKrw(data.current.price)}원`);
+    setKpiText("kpiMarket", `${market} / ${unit == 240 ? "4시간봉" : unit + "분봉"}`);
+    setKpiText("kpiSignal", `${data.signal_score}/5`);
+    setKpiText("kpiRsi", `${data.current.rsi}`);
+
+    renderPriceCandles(data);
+
+    destroyChart(rsiChart);
+    rsiChart = new Chart(document.getElementById("rsiChart"), {
+      type: "line",
+      data: {
+        labels: data.labels,
+        datasets: [
+          { label: "RSI", data: data.rsi, borderColor: "#22c55e", pointRadius: 0, tension: 0.2 },
+          { label: "과매도(30)", data: Array(data.rsi.length).fill(30), borderColor: "rgba(239,68,68,.4)", pointRadius: 0, borderDash: [4, 4] },
+          { label: "과매수(70)", data: Array(data.rsi.length).fill(70), borderColor: "rgba(239,68,68,.4)", pointRadius: 0, borderDash: [4, 4] },
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: "#cbd5e1" } } },
+        scales: {
+          x: { display: false },
+          y: { min: 0, max: 100, grid: { color: "rgba(255,255,255,.06)" }, ticks: { color: "#cbd5e1" } }
+        }
+      }
+    });
+
+    destroyChart(macdChart);
+    macdChart = new Chart(document.getElementById("macdChart"), {
+      data: {
+        labels: data.labels,
+        datasets: [
+          { type: "line", label: "MACD", data: data.macd, borderColor: "#60a5fa", pointRadius: 0, tension: 0.2, yAxisID: "y" },
+          { type: "line", label: "Signal", data: data.macd_signal, borderColor: "#f59e0b", pointRadius: 0, tension: 0.2, yAxisID: "y" },
+          { type: "bar", label: "Hist", data: data.macd_hist, backgroundColor: "rgba(99,102,241,.45)", yAxisID: "y" },
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: { legend: { labels: { color: "#cbd5e1" } } },
+        scales: {
+          x: { display: false },
+          y: { grid: { color: "rgba(255,255,255,.06)" }, ticks: { color: "#cbd5e1" } }
+        }
+      }
+    });
+  } catch (err) {
+    setPriceNotice("차트 데이터를 불러오는 중 오류가 발생했습니다.");
+    console.error(err);
+  }
+}
+
+async function loadMarketEnv() {
+  try {
+    const res = await fetch(`/api/market-env/${market}/`);
+    if (!res.ok) throw new Error("market env api failed");
+    const env = await res.json();
+    if (!env || env.score === undefined) return;
+    setKpiText("kpiEnvScore", `${env.score > 0 ? "+" : ""}${env.score}/100`);
+    setKpiText("kpiEnvText", env.recommendation || "-");
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+loadChartData();
+loadMarketEnv();
+setInterval(() => {
+  loadChartData();
+  loadMarketEnv();
+}, 30000);
+</script>
+{% endblock %}

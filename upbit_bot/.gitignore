@@ -1,0 +1,7 @@
+.env
+trading_log.csv
+performance.json
+bot.log
+*.log
+dashboard_pids.json
+__pycache__/

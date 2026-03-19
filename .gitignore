@@ -1,0 +1,32 @@
+# 환경 변수 / API 키
+.env
+*.env
+
+# 런타임 생성 파일
+*.log
+*.csv
+*.json
+!upbit_bot/requirements.txt
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# config 백업 (최적화 도구 생성)
+config.py.bak
+
+# Claude Code
+.claude/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
