@@ -36,15 +36,11 @@ python main.py --walk-forward --days 180 --windows 4
 # Market scan only (top 10 coins)
 python main.py --scan
 
-# Streamlit dashboard
+# Streamlit dashboard (포트 8501)
 python main.py --dashboard
 
-# Start Django + Streamlit dashboards (Windows)
+# 대시보드 백그라운드 시작/종료 (Windows)
 ./start_dashboards.bat
-# or
-powershell -File start_dashboards.ps1
-
-# Stop dashboards
 powershell -File stop_dashboards.ps1
 ```
 
@@ -129,11 +125,16 @@ All strategy parameters live in `config.py`:
 
 ### Dashboard Architecture
 
-Two separate dashboard components:
-- **Streamlit** (`dashboard.py`): Analytics, charts, performance metrics — reads from log files
-- **Django** (`dashboard_app/`): Scaffolded REST API + HTML templates — largely unused, no persistent DB (SQLite)
+**Streamlit** (`dashboard.py`) 단일 대시보드 — 포트 8501 (포트 충돌 시 자동 증가)
 
-Django port: 8001, Streamlit port: 8501 (auto-increments if occupied). PIDs tracked in `dashboard_pids.json`.
+5개 페이지:
+1. **🔴 실시간 현황** — 봇 상태·포지션·미실현 손익 (10초 자동 갱신, `live_status.json` 읽기)
+2. **실시간 차트 & 지표** — 전체 KRW 코인 선택, 볼린저밴드/RSI/MACD/거래량 차트
+3. **거래 내역 & 성과** — 누적수익 곡선, 일/주/월별 분석, 리스크 지표
+4. **💰 내 업비트 지갑** — API 키로 실제 잔고 조회 (30초 자동 갱신)
+5. **📰 비트코인 뉴스** — CoinDesk·CoinTelegraph 등 RSS 수집 (5분 캐시)
+
+PIDs 추적: `dashboard_pids.json`
 
 ### Logging
 
