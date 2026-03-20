@@ -158,10 +158,11 @@ class MarketEnvironment:
         """
         try:
             ob = pyupbit.get_orderbook(market)
-            if not ob or len(ob) == 0:
+            if not ob:
                 return {"bid_ratio": 0.5, "signal": "조회 실패"}
 
-            orderbook = ob[0]
+            # pyupbit 버전에 따라 list 또는 dict 반환
+            orderbook = ob[0] if isinstance(ob, list) else ob
             units = orderbook.get("orderbook_units", [])
             bid_total = sum(u["bid_size"] for u in units)
             ask_total = sum(u["ask_size"] for u in units)
