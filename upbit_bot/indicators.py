@@ -172,7 +172,9 @@ def get_signal_score(row: pd.Series, config) -> dict:
     # 가격이 EMA200 위에 있거나 EMA200 5% 이내 (과도한 하락 제외)
     near_trend = close >= ema_trend * 0.95
     signals["ema"] = (ema_short > ema_long) and near_trend
-    details["ema"] = f"EMA단기={ema_short:.0f}, EMA장기={ema_long:.0f}, 추세필터={'OK' if near_trend else 'X'}"
+    # 가격 크기에 따라 소수점 자릿수 조정
+    _ema_fmt = ".0f" if ema_short >= 100 else (".1f" if ema_short >= 10 else ".3f")
+    details["ema"] = f"EMA단기={ema_short:{_ema_fmt}}, EMA장기={ema_long:{_ema_fmt}}, 추세필터={'OK' if near_trend else 'X'}"
 
     # ── 5. 거래량 신호 ──
     # 현재 거래량이 평균보다 높을수록 신호 신뢰도 높음
