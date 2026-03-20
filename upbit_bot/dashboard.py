@@ -457,8 +457,16 @@ def _check_trade_notifications():
         price = latest.get("price", 0)
 
         if action == "BUY":
+            amount_krw = latest.get("amount_krw", 0)
+            coin_qty   = latest.get("coin_qty", 0)
+            try:
+                qty_str = f"{float(coin_qty):.4f}개"
+            except Exception:
+                qty_str = "—"
             st.toast(
-                f"🟢 매수 체결!  {market}  {fmt_price(float(price))}",
+                f"🟢 매수 체결!  {market}\n"
+                f"체결가 {fmt_price(float(price))}  ×  {qty_str}\n"
+                f"총액 {float(amount_krw):,.0f}원",
                 icon="🛒",
             )
         elif action == "SELL":
