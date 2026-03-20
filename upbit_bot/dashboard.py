@@ -145,6 +145,16 @@ def get_sell_trades(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["action"] == "SELL"].copy()
 
 
+@st.cache_data(ttl=3)
+def get_realtime_price(market: str) -> float:
+    """현재 실시간 체결가 조회 (3초 캐시)"""
+    try:
+        price = pyupbit.get_current_price(market)
+        return float(price) if price else 0.0
+    except Exception:
+        return 0.0
+
+
 @st.cache_data(ttl=60)
 def load_chart_data(market: str, unit: int = 60, count: int = 200) -> pd.DataFrame:
     df = pyupbit.get_ohlcv(market, interval=f"minute{unit}", count=count)
@@ -562,6 +572,7 @@ if page == "🔴 실시간 현황":
 # ══════════════════════════════════════════════════════════════
 
 elif page == "실시간 차트 & 지표":
+    st_autorefresh(interval=5_000, key="chart_refresh")
     st.title(f"📈 {chart_market} 실시간 분석")
 
     chart_df = load_chart_data(chart_market, chart_unit)
@@ -571,10 +582,13 @@ elif page == "실시간 차트 & 지표":
 
     last = chart_df.iloc[-1]
     prev = chart_df.iloc[-2]
-    change_pct = (last["close"] - prev["close"]) / prev["close"] * 100
+
+    # 실시간 체결가 (3초 캐시) — 캔들 종가(최대 60분 지연) 대신 사용
+    realtime_price = get_realtime_price(chart_market) or last["close"]
+    change_pct = (realtime_price - prev["close"]) / prev["close"] * 100
 
     kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-    kpi1.metric("현재가", f"{last['close']:,.0f}원", delta=f"{change_pct:+.2f}%")
+    kpi1.metric("현재가", f"{realtime_price:,.0f}원", delta=f"{change_pct:+.2f}%")
     kpi2.metric("RSI", f"{last['rsi']:.1f}",
                 delta="과매도" if last['rsi'] < 30 else ("과매수" if last['rsi'] > 70 else ""))
     kpi3.metric("MACD", f"{last['macd']:,.0f}",
