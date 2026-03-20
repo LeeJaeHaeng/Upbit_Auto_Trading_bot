@@ -323,20 +323,63 @@ page = st.sidebar.radio(
 )
 
 @st.cache_data(ttl=3600)
-def _all_krw_markets() -> list:
+def _load_market_info() -> dict:
+    """업비트 전체 KRW 마켓 + 한글/영문 이름 반환 {market: {korean, english}}"""
     try:
-        markets = pyupbit.get_tickers(fiat="KRW") or []
-        return sorted(markets)
+        resp = requests.get(
+            "https://api.upbit.com/v1/market/all?isDetails=true",
+            timeout=10,
+        )
+        data = resp.json()
+        return {
+            d["market"]: {
+                "korean": d.get("korean_name", ""),
+                "english": d.get("english_name", ""),
+            }
+            for d in data
+            if d["market"].startswith("KRW-")
+        }
     except Exception:
-        return ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE"]
+        return {}
 
-_krw_markets = _all_krw_markets()
-_default_idx = _krw_markets.index("KRW-BTC") if "KRW-BTC" in _krw_markets else 0
+_market_info = _load_market_info()
+_krw_markets = sorted(_market_info.keys()) if _market_info else (
+    pyupbit.get_tickers(fiat="KRW") or ["KRW-BTC"]
+)
+
+_search = st.sidebar.text_input(
+    "코인 검색",
+    placeholder="예: BTC, 비트코인, Bitcoin...",
+    key="market_search",
+).strip()
+
+_search_upper = _search.upper()
+if _search:
+    _filtered_markets = [
+        m for m in _krw_markets
+        if _search_upper in m
+        or _search in _market_info.get(m, {}).get("korean", "")
+        or _search_upper in _market_info.get(m, {}).get("english", "").upper()
+    ]
+    if not _filtered_markets:
+        _filtered_markets = _krw_markets
+else:
+    _filtered_markets = _krw_markets
+
+def _market_label(m: str) -> str:
+    info = _market_info.get(m, {})
+    ko = info.get("korean", "")
+    return f"{m}  {ko}" if ko else m
+
+_default_idx = (
+    _filtered_markets.index("KRW-BTC") if "KRW-BTC" in _filtered_markets else 0
+)
 
 chart_market = st.sidebar.selectbox(
-    f"차트 마켓 (전체 {len(_krw_markets)}개)",
-    _krw_markets,
+    f"차트 마켓 ({len(_filtered_markets)}{'/' + str(len(_krw_markets)) if _search else ''}개)",
+    _filtered_markets,
     index=_default_idx,
+    format_func=_market_label,
 )
 
 chart_unit = st.sidebar.selectbox(
