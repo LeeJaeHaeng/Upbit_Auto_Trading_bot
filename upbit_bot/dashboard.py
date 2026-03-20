@@ -155,6 +155,27 @@ def get_realtime_price(market: str) -> float:
         return 0.0
 
 
+def fmt_price(price: float) -> str:
+    """가격 크기에 따라 소수점 자릿수 자동 조정
+    >= 100원  → 0자리  (104,283,000원)
+    >= 10원   → 1자리  (12.2원)
+    >= 1원    → 2자리  (1.23원)
+    >= 0.01원 → 4자리  (0.0234원)
+    그 이하   → 6자리
+    """
+    if price <= 0:
+        return "—"
+    if price >= 100:
+        return f"{price:,.0f}원"
+    if price >= 10:
+        return f"{price:,.1f}원"
+    if price >= 1:
+        return f"{price:,.2f}원"
+    if price >= 0.01:
+        return f"{price:,.4f}원"
+    return f"{price:,.6f}원"
+
+
 @st.cache_data(ttl=60)
 def load_chart_data(market: str, unit: int = 60, count: int = 200) -> pd.DataFrame:
     df = pyupbit.get_ohlcv(market, interval=f"minute{unit}", count=count)
@@ -482,7 +503,7 @@ if page == "🔴 실시간 현황":
             delta_color="normal",
         )
         kpi_cols[2].metric("포지션 평가액", f"{pos_val:,.0f} 원")
-        kpi_cols[3].metric("현재가", f"{cur_price:,.0f} 원")
+        kpi_cols[3].metric("현재가", fmt_price(cur_price))
 
         st.markdown("---")
 
@@ -536,14 +557,14 @@ if page == "🔴 실시간 현황":
         buy_amount = live.get("pending_buy_amount", 0)
         cur_price = pyupbit.get_current_price(market) if market else 0
 
-        kpi_cols[1].metric("대기 매수가", f"{buy_price:,.0f} 원")
+        kpi_cols[1].metric("대기 매수가", fmt_price(buy_price))
         kpi_cols[2].metric("주문 금액", f"{buy_amount:,.0f} 원")
-        kpi_cols[3].metric("현재가", f"{cur_price:,.0f} 원" if cur_price else "—")
+        kpi_cols[3].metric("현재가", fmt_price(cur_price) if cur_price else "—")
 
         st.markdown("---")
         st.info(
             f"**{market}** 지정가 매수 주문 대기 중\n\n"
-            f"주문가: **{buy_price:,.0f}원** | 현재가: {cur_price:,.0f}원 | "
+            f"주문가: **{fmt_price(buy_price)}** | 현재가: {fmt_price(cur_price)} | "
             f"금액: {buy_amount:,.0f}원\n\n"
             "현재가가 주문가 이하로 내려오면 체결됩니다. (최대 30분 대기)"
         )
@@ -588,7 +609,7 @@ elif page == "실시간 차트 & 지표":
     change_pct = (realtime_price - prev["close"]) / prev["close"] * 100
 
     kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-    kpi1.metric("현재가", f"{realtime_price:,.0f}원", delta=f"{change_pct:+.2f}%")
+    kpi1.metric("현재가", fmt_price(realtime_price), delta=f"{change_pct:+.2f}%")
     kpi2.metric("RSI", f"{last['rsi']:.1f}",
                 delta="과매도" if last['rsi'] < 30 else ("과매수" if last['rsi'] > 70 else ""))
     kpi3.metric("MACD", f"{last['macd']:,.0f}",
