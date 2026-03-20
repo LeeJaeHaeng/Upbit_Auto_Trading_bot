@@ -426,6 +426,62 @@ if st.sidebar.button("🔄 새로고침"):
 
 
 # ══════════════════════════════════════════════════════════════
+# 전역 거래 알림 (어느 페이지에서든 체결 시 토스트 팝업)
+# ══════════════════════════════════════════════════════════════
+
+def _check_trade_notifications():
+    """
+    거래 로그의 최신 체결 내역을 감지하여 st.toast() 알림 표시.
+    session_state에 마지막으로 본 trade_id를 저장해 중복 알림 방지.
+    """
+    try:
+        if not Path(LOG_FILE).exists():
+            return
+        df = pd.read_csv(LOG_FILE, encoding="utf-8")
+        if df.empty:
+            return
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        latest = df.iloc[-1]
+        trade_id = str(latest["timestamp"])
+
+        last_seen = st.session_state.get("_last_trade_id", None)
+        if last_seen == trade_id:
+            return  # 이미 알림한 거래
+
+        st.session_state["_last_trade_id"] = trade_id
+        if last_seen is None:
+            return  # 첫 로드 시에는 알림 생략 (과거 거래 무시)
+
+        action = str(latest.get("action", "")).upper()
+        market = latest.get("market", "")
+        price = latest.get("price", 0)
+
+        if action == "BUY":
+            st.toast(
+                f"🟢 매수 체결!  {market}  {fmt_price(float(price))}",
+                icon="🛒",
+            )
+        elif action == "SELL":
+            pnl_krw = latest.get("pnl_krw", 0)
+            pnl_pct = latest.get("pnl_pct", 0)
+            reason  = latest.get("reason", "")
+            if float(pnl_krw) >= 0:
+                st.toast(
+                    f"✅ 매도 체결!  {market}  {float(pnl_krw):+,.0f}원 ({float(pnl_pct):+.2f}%)  |  {reason}",
+                    icon="💰",
+                )
+            else:
+                st.toast(
+                    f"🔴 매도 체결!  {market}  {float(pnl_krw):+,.0f}원 ({float(pnl_pct):+.2f}%)  |  {reason}",
+                    icon="📉",
+                )
+    except Exception:
+        pass
+
+_check_trade_notifications()
+
+
+# ══════════════════════════════════════════════════════════════
 # 페이지 1: 실시간 현황 (봇 상태 · 모의 포지션 · 미실현 손익)
 # ══════════════════════════════════════════════════════════════
 
