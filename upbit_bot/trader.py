@@ -86,6 +86,8 @@ class Trader:
 
         # 상태 영속화 파일 (비정상 종료 후 복구용)
         self._state_file = Path(config.BASE_DIR) / "bot_state.json"
+        # 대시보드 실시간 현황 공유 파일 (매 사이클 갱신)
+        self._live_status_file = Path(config.BASE_DIR) / "live_status.json"
 
         # BUY_WAITING/POSITION 중 국면 재확인 카운터
         self._trend_check_counter = 0
@@ -122,6 +124,7 @@ class Trader:
                     self._handle_position(now)
 
                 self._consecutive_errors = 0  # 정상 사이클 시 오류 카운터 리셋
+                self._write_live_status()     # 대시보드용 실시간 상태 갱신
                 time.sleep(self.config.CHECK_INTERVAL)
 
             except KeyboardInterrupt:
@@ -818,6 +821,69 @@ class Trader:
         except Exception as e:
             logger.warning(f"상태 파일 삭제 실패: {e}")
 
+    def _write_live_status(self):
+        """대시보드에서 읽을 실시간 현황을 live_status.json에 기록합니다 (매 사이클)."""
+        try:
+            status: dict = {
+                "state": self.state,
+                "mode": "live" if not self.config.PAPER_TRADING else "paper",
+                "paper_capital": self.paper_capital,
+                "last_updated": datetime.now().isoformat(),
+            }
+
+            if self.state in (STATE_BUY_WAITING, STATE_POSITION):
+                status["market"] = self.current_market
+
+            if self.state == STATE_BUY_WAITING:
+                buy_order = self.order_mgr.active_buy_order
+                if buy_order:
+                    status["pending_buy_price"] = buy_order.get("price", 0)
+                    status["pending_buy_amount"] = self._pending_trade_amount
+
+            if self.state == STATE_POSITION and self.entry_price > 0:
+                current_price = self.api_client.get_current_price(self.current_market) or self.entry_price
+                avg_price = self._avg_entry_price if self._avg_entry_price > 0 else self.entry_price
+                unrealized_pct = (current_price - avg_price) / avg_price * 100
+                unrealized_krw = (current_price - avg_price) * self.coin_qty
+
+                status.update({
+                    "entry_price": self.entry_price,
+                    "avg_entry_price": avg_price,
+                    "coin_qty": self.coin_qty,
+                    "current_price": current_price,
+                    "highest_price": self.highest_price,
+                    "unrealized_pct": round(unrealized_pct, 4),
+                    "unrealized_krw": round(unrealized_krw, 0),
+                    "position_value_krw": round(current_price * self.coin_qty, 0),
+                    "dca_done": self._dca_done,
+                    "breakeven_activated": self._breakeven_activated,
+                })
+                tp_order = self.order_mgr.active_tp_order
+                sl_order = self.order_mgr.active_sl_order
+                if tp_order:
+                    status["tp_price"] = tp_order.get("price", 0)
+                if sl_order:
+                    status["sl_price"] = sl_order.get("price", 0)
+
+            with open(self._live_status_file, "w", encoding="utf-8") as f:
+                json.dump(status, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.debug(f"live_status 기록 실패 (무시): {e}")
+
+    def _clear_live_status(self):
+        """봇 종료 시 live_status.json에 종료 상태를 기록합니다."""
+        try:
+            status = {
+                "state": "stopped",
+                "mode": "live" if not self.config.PAPER_TRADING else "paper",
+                "paper_capital": self.paper_capital,
+                "last_updated": datetime.now().isoformat(),
+            }
+            with open(self._live_status_file, "w", encoding="utf-8") as f:
+                json.dump(status, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
     def _try_recover_state(self):
         """봇 시작 시 이전 상태 파일이 있으면 복구를 시도합니다."""
         if not self._state_file.exists():
@@ -914,6 +980,7 @@ class Trader:
                 f"예상치 못한 종료 감지 (상태={self.state}) → 상태 파일 저장"
             )
             self._save_state()
+        self._clear_live_status()
 
     # ──────────────────────────────────────────
 
@@ -962,3 +1029,4 @@ class Trader:
                 print("  ℹ️ 기존 지정가 매도 주문은 유지됩니다.")
 
         self.trade_logger.print_summary()
+        self._clear_live_status()

@@ -19,6 +19,7 @@ from pathlib import Path
 import psutil
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 from env_utils import load_env_file
 
@@ -43,6 +44,7 @@ import config as cfg
 LOG_FILE = cfg.LOG_FILE
 PERFORMANCE_FILE = cfg.PERFORMANCE_FILE
 BOT_PID_FILE = Path(__file__).parent / "bot_pid.json"
+LIVE_STATUS_FILE = Path(__file__).parent / "live_status.json"
 BOT_DIR = Path(__file__).parent
 
 
@@ -311,7 +313,13 @@ st.sidebar.markdown("---")
 # ── 페이지 선택 ──
 page = st.sidebar.radio(
     "페이지",
-    ["실시간 차트 & 지표", "거래 내역 & 성과", "📰 비트코인 뉴스"],
+    [
+        "🔴 실시간 현황",
+        "실시간 차트 & 지표",
+        "거래 내역 & 성과",
+        "💰 내 업비트 지갑",
+        "📰 비트코인 뉴스",
+    ],
 )
 
 chart_market = st.sidebar.selectbox(
@@ -333,10 +341,173 @@ if st.sidebar.button("🔄 새로고침"):
 
 
 # ══════════════════════════════════════════════════════════════
-# 페이지 1: 실시간 차트 & 기술적 지표 & 시장 환경
+# 페이지 1: 실시간 현황 (봇 상태 · 모의 포지션 · 미실현 손익)
 # ══════════════════════════════════════════════════════════════
 
-if page == "실시간 차트 & 지표":
+def _load_live_status() -> dict:
+    """live_status.json 읽기 (캐시 없이 매번 읽어 최신 값 보장)"""
+    try:
+        if LIVE_STATUS_FILE.exists():
+            with open(LIVE_STATUS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+STATE_KO = {
+    "idle":        ("🔍 IDLE",       "대기 중 — 매수 기회 탐색"),
+    "buy_waiting": ("⏳ BUY_WAITING", "지정가 매수 주문 체결 대기"),
+    "position":    ("📦 POSITION",   "포지션 보유 중 — 익절/손절 대기"),
+    "stopped":     ("⏹ 정지",        "봇이 실행 중이지 않습니다"),
+}
+
+
+if page == "🔴 실시간 현황":
+    # 자동 새로고침: 10초마다 (봇 CHECK_INTERVAL 과 동기화)
+    st_autorefresh(interval=10_000, key="live_refresh")
+
+    st.title("🔴 실시간 현황")
+    st.caption("봇 상태·모의 포지션·미실현 손익을 10초마다 자동 갱신합니다.")
+
+    live = _load_live_status()
+
+    if not live:
+        st.warning("봇이 실행 중이지 않거나 아직 첫 사이클이 완료되지 않았습니다.\n\n"
+                   "사이드바에서 **봇 시작** 버튼을 누른 후 10~30초를 기다리세요.")
+        st.stop()
+
+    raw_state = live.get("state", "stopped")
+    state_label, state_desc = STATE_KO.get(raw_state, (raw_state, ""))
+    mode_str = "💰 실거래" if live.get("mode") == "live" else "📄 페이퍼 트레이딩"
+    updated = live.get("last_updated", "")
+
+    # ── 상단 상태 배너 ──
+    if raw_state == "position":
+        st.success(f"**{state_label}** — {state_desc}  |  {mode_str}")
+    elif raw_state == "buy_waiting":
+        st.warning(f"**{state_label}** — {state_desc}  |  {mode_str}")
+    elif raw_state == "idle":
+        st.info(f"**{state_label}** — {state_desc}  |  {mode_str}")
+    else:
+        st.error(f"**{state_label}**  |  {mode_str}")
+
+    st.caption(f"마지막 봇 갱신: {updated}")
+    st.markdown("---")
+
+    # ── KPI 행 ──
+    paper_capital = live.get("paper_capital", 0)
+    kpi_cols = st.columns(4)
+
+    kpi_cols[0].metric(
+        "모의 잔고",
+        f"{paper_capital:,.0f} 원",
+        help="현재 페이퍼 트레이딩 잔고 (매수 후에는 잔고가 줄고 매도 후 복구됩니다)",
+    )
+
+    if raw_state == "position" and live.get("entry_price"):
+        upnl_pct = live.get("unrealized_pct", 0)
+        upnl_krw = live.get("unrealized_krw", 0)
+        pos_val  = live.get("position_value_krw", 0)
+        cur_price = live.get("current_price", 0)
+
+        kpi_cols[1].metric(
+            "미실현 손익",
+            f"{upnl_krw:+,.0f} 원",
+            delta=f"{upnl_pct:+.2f}%",
+            delta_color="normal",
+        )
+        kpi_cols[2].metric("포지션 평가액", f"{pos_val:,.0f} 원")
+        kpi_cols[3].metric("현재가", f"{cur_price:,.0f} 원")
+
+        st.markdown("---")
+
+        # ── 포지션 상세 ──
+        st.subheader(f"📦 포지션 상세 — {live.get('market', '')}")
+
+        avg_price = live.get("avg_entry_price") or live.get("entry_price", 0)
+        entry_price = live.get("entry_price", 0)
+        coin_qty = live.get("coin_qty", 0)
+        highest_price = live.get("highest_price", 0)
+        tp_price = live.get("tp_price", 0)
+        sl_price = live.get("sl_price", 0)
+        dca_done = live.get("dca_done", False)
+        be_activated = live.get("breakeven_activated", False)
+
+        col_d1, col_d2, col_d3 = st.columns(3)
+        with col_d1:
+            st.markdown("**진입 정보**")
+            st.write(f"- 1차 매수가: **{entry_price:,.0f}** 원")
+            if dca_done:
+                st.write(f"- 평균단가 (DCA): **{avg_price:,.0f}** 원")
+            st.write(f"- 보유 수량: `{coin_qty:.8f}`")
+            st.write(f"- 고점: {highest_price:,.0f} 원")
+
+        with col_d2:
+            st.markdown("**TP / SL**")
+            if tp_price:
+                tp_dist = (tp_price - cur_price) / cur_price * 100
+                st.write(f"- 익절가 (TP): **{tp_price:,.0f}** 원  `{tp_dist:+.2f}%`")
+            if sl_price:
+                sl_dist = (sl_price - cur_price) / cur_price * 100
+                st.write(f"- 손절가 (SL): **{sl_price:,.0f}** 원  `{sl_dist:+.2f}%`")
+
+        with col_d3:
+            st.markdown("**기능 활성 여부**")
+            st.write(f"- DCA 2차 매수: {'✅ 완료' if dca_done else '⏳ 대기 중'}")
+            st.write(f"- 본전 보호 스탑: {'✅ 활성' if be_activated else '❌ 미활성'}")
+
+        # ── 진입가 / TP / SL / 현재가 시각화 ──
+        if all([avg_price, cur_price, tp_price, sl_price]):
+            st.markdown("**가격 레벨 시각화**")
+            level_data = pd.DataFrame({
+                "가격": [sl_price, avg_price, cur_price, tp_price],
+                "레이블": ["손절(SL)", "평균진입가", "현재가", "익절(TP)"],
+            }).set_index("레이블")
+            st.bar_chart(level_data, use_container_width=True, height=200)
+
+    elif raw_state == "buy_waiting":
+        market = live.get("market", "")
+        buy_price = live.get("pending_buy_price", 0)
+        buy_amount = live.get("pending_buy_amount", 0)
+        cur_price = pyupbit.get_current_price(market) if market else 0
+
+        kpi_cols[1].metric("대기 매수가", f"{buy_price:,.0f} 원")
+        kpi_cols[2].metric("주문 금액", f"{buy_amount:,.0f} 원")
+        kpi_cols[3].metric("현재가", f"{cur_price:,.0f} 원" if cur_price else "—")
+
+        st.markdown("---")
+        st.info(
+            f"**{market}** 지정가 매수 주문 대기 중\n\n"
+            f"주문가: **{buy_price:,.0f}원** | 현재가: {cur_price:,.0f}원 | "
+            f"금액: {buy_amount:,.0f}원\n\n"
+            "현재가가 주문가 이하로 내려오면 체결됩니다. (최대 30분 대기)"
+        )
+
+    else:
+        kpi_cols[1].metric("포지션", "없음")
+        kpi_cols[2].metric("미실현 손익", "—")
+        kpi_cols[3].metric("현재가", "—")
+
+    # ── 최근 거래 내역 (실시간 현황 하단) ──
+    st.markdown("---")
+    st.subheader("📋 최근 거래 (최근 10건)")
+    trade_df_live = load_trade_log()
+    if not trade_df_live.empty:
+        recent = trade_df_live.sort_values("timestamp", ascending=False).head(10).copy()
+        recent["timestamp"] = recent["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        show_cols = [c for c in ["timestamp", "action", "market", "price", "pnl_krw", "pnl_pct", "reason"]
+                     if c in recent.columns]
+        st.dataframe(recent[show_cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("아직 거래 기록이 없습니다.")
+
+
+# ══════════════════════════════════════════════════════════════
+# 페이지 2: 실시간 차트 & 기술적 지표 & 시장 환경
+# ══════════════════════════════════════════════════════════════
+
+elif page == "실시간 차트 & 지표":
     st.title(f"📈 {chart_market} 실시간 분석")
 
     chart_df = load_chart_data(chart_market, chart_unit)
@@ -648,7 +819,132 @@ elif page == "거래 내역 & 성과":
 
 
 # ══════════════════════════════════════════════════════════════
-# 페이지 3: 비트코인 뉴스
+# 페이지 4: 내 업비트 지갑 현황
+# ══════════════════════════════════════════════════════════════
+
+elif page == "💰 내 업비트 지갑":
+    st_autorefresh(interval=30_000, key="wallet_refresh")
+
+    st.title("💰 내 업비트 지갑 현황")
+    st.caption("업비트 API 키로 실시간 잔고를 조회합니다. 30초마다 자동 갱신.")
+
+    access_key = getattr(cfg, "ACCESS_KEY", "YOUR_ACCESS_KEY")
+    secret_key = getattr(cfg, "SECRET_KEY", "YOUR_SECRET_KEY")
+
+    if access_key in ("YOUR_ACCESS_KEY", "", None):
+        st.error(
+            "API 키가 설정되어 있지 않습니다.\n\n"
+            "`upbit_bot/.env` 파일에 `UPBIT_ACCESS_KEY` 와 `UPBIT_SECRET_KEY` 를 입력하세요."
+        )
+        st.code(
+            "UPBIT_ACCESS_KEY=your_access_key_here\n"
+            "UPBIT_SECRET_KEY=your_secret_key_here",
+            language="bash",
+        )
+        st.stop()
+
+    try:
+        upbit_obj = pyupbit.Upbit(access_key, secret_key)
+        balances_raw = upbit_obj.get_balances()
+    except Exception as e:
+        st.error(f"업비트 API 연결 실패: {e}\n\nAPI 키 및 IP 허용 설정을 확인하세요.")
+        st.stop()
+
+    if not balances_raw:
+        st.warning("잔고 정보를 가져오지 못했습니다. API 권한을 확인하세요.")
+        st.stop()
+
+    # ── 잔고 파싱 ──
+    rows = []
+    total_krw_equiv = 0.0
+
+    for b in balances_raw:
+        currency = b.get("currency", "")
+        balance = float(b.get("balance") or 0)
+        locked = float(b.get("locked") or 0)
+        avg_buy_price = float(b.get("avg_buy_price") or 0)
+        total_qty = balance + locked
+
+        if total_qty <= 0:
+            continue
+
+        if currency == "KRW":
+            current_price = 1.0
+            eval_krw = total_qty
+            pnl_pct = 0.0
+            pnl_krw = 0.0
+        else:
+            market = f"KRW-{currency}"
+            current_price = pyupbit.get_current_price(market) or 0.0
+            eval_krw = total_qty * current_price
+            if avg_buy_price > 0 and current_price > 0:
+                pnl_pct = (current_price - avg_buy_price) / avg_buy_price * 100
+                pnl_krw = (current_price - avg_buy_price) * total_qty
+            else:
+                pnl_pct = 0.0
+                pnl_krw = 0.0
+
+        total_krw_equiv += eval_krw
+        rows.append({
+            "코인": currency,
+            "보유 수량": total_qty,
+            "잠금 수량": locked,
+            "평균 매수가": avg_buy_price,
+            "현재가": current_price,
+            "평가금액 (KRW)": eval_krw,
+            "평가손익 (KRW)": pnl_krw,
+            "수익률 (%)": pnl_pct,
+        })
+
+    wallet_df = pd.DataFrame(rows)
+
+    # ── 총 자산 KPI ──
+    krw_row = wallet_df[wallet_df["코인"] == "KRW"]
+    krw_balance = krw_row["평가금액 (KRW)"].values[0] if not krw_row.empty else 0.0
+    coin_eval = total_krw_equiv - krw_balance
+
+    w1, w2, w3 = st.columns(3)
+    w1.metric("총 평가금액", f"{total_krw_equiv:,.0f} 원")
+    w2.metric("KRW 잔고", f"{krw_balance:,.0f} 원")
+    w3.metric("코인 평가액", f"{coin_eval:,.0f} 원")
+
+    st.markdown("---")
+
+    # ── 코인별 보유 현황 테이블 ──
+    st.subheader("보유 자산 현황")
+    coin_df = wallet_df[wallet_df["코인"] != "KRW"].copy() if len(wallet_df) > 1 else pd.DataFrame()
+
+    if not coin_df.empty:
+        display_wallet = coin_df[[
+            "코인", "보유 수량", "평균 매수가", "현재가",
+            "평가금액 (KRW)", "평가손익 (KRW)", "수익률 (%)"
+        ]].copy()
+        display_wallet["평균 매수가"]     = display_wallet["평균 매수가"].map(lambda x: f"{x:,.0f}")
+        display_wallet["현재가"]          = display_wallet["현재가"].map(lambda x: f"{x:,.0f}")
+        display_wallet["평가금액 (KRW)"]  = display_wallet["평가금액 (KRW)"].map(lambda x: f"{x:,.0f}")
+        display_wallet["평가손익 (KRW)"]  = display_wallet["평가손익 (KRW)"].map(lambda x: f"{x:+,.0f}")
+        display_wallet["수익률 (%)"]      = display_wallet["수익률 (%)"].map(lambda x: f"{x:+.2f}%")
+        display_wallet["보유 수량"]       = display_wallet["보유 수량"].map(lambda x: f"{x:.8f}".rstrip("0").rstrip("."))
+
+        st.dataframe(display_wallet, use_container_width=True, hide_index=True)
+
+        # ── 코인 비중 차트 ──
+        st.subheader("자산 구성 비중")
+        pie_df = pd.DataFrame({
+            "자산": ["KRW"] + coin_df["코인"].tolist(),
+            "평가액": [krw_balance] + coin_df["평가금액 (KRW)"].tolist(),
+        }).set_index("자산")
+        st.bar_chart(pie_df, use_container_width=True, height=300)
+    else:
+        st.info("보유 중인 코인이 없습니다. KRW만 보유 중입니다.")
+
+    # ── KRW 잔고 별도 표시 ──
+    st.markdown("---")
+    st.caption(f"원화(KRW) 잔고: **{krw_balance:,.0f}원** | 조회 시각: {datetime.now().strftime('%H:%M:%S')}")
+
+
+# ══════════════════════════════════════════════════════════════
+# 페이지 5: 비트코인 뉴스
 # ══════════════════════════════════════════════════════════════
 
 elif page == "📰 비트코인 뉴스":
