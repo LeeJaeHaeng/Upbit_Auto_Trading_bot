@@ -28,7 +28,7 @@ load_env_file(Path(__file__).resolve().parent)
 import pyupbit
 
 sys.path.insert(0, str(Path(__file__).parent))
-from indicators import add_all_indicators
+from indicators import add_all_indicators, get_signal_score
 from market_indicators import MarketEnvironment
 
 # ── 페이지 설정 ──
@@ -353,6 +353,48 @@ page = st.sidebar.radio(
     ],
 )
 
+@st.cache_data(ttl=300)
+def _get_volume_filtered_markets(top_n: int = 50) -> list:
+    """24시간 거래대금 기준 상위 N개 KRW 마켓 반환 (5분 캐시)"""
+    try:
+        tickers = pyupbit.get_tickers(fiat="KRW") or []
+        rows = []
+        prices = pyupbit.get_current_price(tickers) or {}
+        for t in tickers:
+            try:
+                df = pyupbit.get_ohlcv(t, interval="day", count=1)
+                if df is not None and not df.empty:
+                    rows.append({"market": t, "value": df.iloc[-1]["value"]})
+            except Exception:
+                continue
+        rows.sort(key=lambda x: x["value"], reverse=True)
+        return [r["market"] for r in rows[:top_n]]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=300)
+def _scan_signal_scores(markets: tuple) -> dict:
+    """각 마켓의 매수 신호 수 반환 {market: score}. 5분 캐시."""
+    scores = {}
+    for market in markets:
+        try:
+            df = pyupbit.get_ohlcv(market, interval=f"minute{cfg.CANDLE_UNIT}", count=100)
+            if df is None or len(df) < 30:
+                scores[market] = 0
+                continue
+            df.columns = ["open", "high", "low", "close", "volume", "value"]
+            df = add_all_indicators(df, cfg)
+            df = df.dropna()
+            if df.empty:
+                scores[market] = 0
+                continue
+            scores[market] = get_signal_score(df.iloc[-1], cfg)["score"]
+        except Exception:
+            scores[market] = 0
+    return scores
+
+
 @st.cache_data(ttl=3600)
 def _load_market_info() -> dict:
     """업비트 전체 KRW 마켓 + 한글/영문 이름 반환 {market: {korean, english}}"""
@@ -384,6 +426,13 @@ _search = st.sidebar.text_input(
     key="market_search",
 ).strip()
 
+_sort_mode = st.sidebar.radio(
+    "정렬",
+    ["기본 (알파벳)", "📶 신호 높은 순"],
+    horizontal=True,
+    key="market_sort",
+)
+
 _search_upper = _search.upper()
 if _search:
     _filtered_markets = [
@@ -397,10 +446,31 @@ if _search:
 else:
     _filtered_markets = _krw_markets
 
+# 신호 점수 스캔 및 정렬
+_signal_scores: dict = {}
+if _sort_mode == "📶 신호 높은 순":
+    # 검색 결과가 있으면 그 범위만, 없으면 거래대금 상위 50개 스캔
+    if _search:
+        _scan_targets = tuple(_filtered_markets)
+    else:
+        with st.sidebar.status("📡 신호 스캔 중...", expanded=False):
+            _vol_markets = _get_volume_filtered_markets(top_n=50)
+        _scan_targets = tuple(_vol_markets) if _vol_markets else tuple(_filtered_markets[:50])
+
+    _signal_scores = _scan_signal_scores(_scan_targets)
+
+    # 신호 있는 코인 앞으로, 동점이면 신호 수 내림차순
+    _scanned = [m for m in _filtered_markets if m in _signal_scores]
+    _not_scanned = [m for m in _filtered_markets if m not in _signal_scores]
+    _scanned.sort(key=lambda m: _signal_scores.get(m, 0), reverse=True)
+    _filtered_markets = _scanned + _not_scanned
+
 def _market_label(m: str) -> str:
     info = _market_info.get(m, {})
     ko = info.get("korean", "")
-    return f"{m}  {ko}" if ko else m
+    score = _signal_scores.get(m)
+    badge = f"⭐{score}/5  " if score is not None else ""
+    return f"{badge}{m}  {ko}" if ko else f"{badge}{m}"
 
 _default_idx = (
     _filtered_markets.index("KRW-BTC") if "KRW-BTC" in _filtered_markets else 0
@@ -785,7 +855,6 @@ elif page == "실시간 차트 & 지표":
 
     st.subheader("🎯 현재 매수 신호 요약")
 
-    from indicators import get_signal_score
     signal_result = get_signal_score(last, cfg)
     signals = signal_result["signals"]
     details = signal_result["details"]
