@@ -31,7 +31,7 @@ CANDLE_COUNT = 200          # 가져올 캔들 수
 
 # RSI
 RSI_PERIOD = 14
-RSI_OVERSOLD = 25           # 과매도 기준 (매수 신호) — 최적화: 30→25
+RSI_OVERSOLD = 35           # 과매도 기준 (매수 신호) — 완화: 25→35 (표준 과매도)
 RSI_OVERBOUGHT = 70         # 과매수 기준 (매도 신호)
 
 # MACD
@@ -50,7 +50,7 @@ EMA_TREND = 200             # 장기 추세 필터
 
 # 거래량 필터
 VOLUME_MA_PERIOD = 20       # 거래량 이동평균 기간
-VOLUME_THRESHOLD = 1.5      # 평균 거래량 대비 배율 (백테스트 결과 2.0은 역효과 — 1.5 최적)
+VOLUME_THRESHOLD = 1.2      # 평균 거래량 대비 배율 — 완화: 1.5→1.2 (진입 빈도 증가)
 
 # =====================================================
 # 리스크 관리 (최적화 결과 반영)
@@ -75,7 +75,7 @@ MIN_SIGNAL_COUNT = 3
 # 다중 시간대 추세 확인 (Multi-Timeframe)
 # =====================================================
 # 60분봉 신호 진입 전 4시간봉 EMA 추세가 일치하는지 확인
-MTF_CHECK = True            # True: 4h 추세 확인 활성화
+MTF_CHECK = False           # True: 4h 추세 확인 활성화 / False: 비활성화 (완화)
 MTF_CANDLE_UNIT = 240       # 4시간봉
 MTF_EMA_SHORT = 20          # 4h 단기 EMA
 MTF_EMA_LONG = 50           # 4h 장기 EMA (이 이상 단기 EMA여야 진입 허용)
