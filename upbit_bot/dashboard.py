@@ -519,16 +519,8 @@ elif page == "실시간 차트 & 지표":
     prev = chart_df.iloc[-2]
     change_pct = (last["close"] - prev["close"]) / prev["close"] * 100
 
-    def _fmt_price(p: float) -> str:
-        """가격을 읽기 쉽게 포맷 (1억 이상: 억단위, 1만 이상: 만단위, 그 외 소수점)"""
-        if p >= 1_0000_0000:
-            return f"{p / 1_0000_0000:.2f}억원"
-        if p >= 1_0000:
-            return f"{p / 1_0000:,.1f}만원"
-        return f"{p:,.2f}원"
-
     kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-    kpi1.metric("현재가", _fmt_price(last['close']), delta=f"{change_pct:+.2f}%")
+    kpi1.metric("현재가", f"{last['close']:,.0f}원", delta=f"{change_pct:+.2f}%")
     kpi2.metric("RSI", f"{last['rsi']:.1f}",
                 delta="과매도" if last['rsi'] < 30 else ("과매수" if last['rsi'] > 70 else ""))
     kpi3.metric("MACD", f"{last['macd']:,.0f}",
