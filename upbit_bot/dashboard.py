@@ -355,43 +355,53 @@ page = st.sidebar.radio(
 
 @st.cache_data(ttl=300)
 def _get_volume_filtered_markets(top_n: int = 50) -> list:
-    """24시간 거래대금 기준 상위 N개 KRW 마켓 반환 (5분 캐시)"""
+    """업비트 REST /v1/ticker 배치 조회로 24h 거래대금 상위 N개 반환 (API 1회 호출)"""
     try:
         tickers = pyupbit.get_tickers(fiat="KRW") or []
+        # 100개씩 나눠서 배치 조회 (Upbit API 한도)
         rows = []
-        prices = pyupbit.get_current_price(tickers) or {}
-        for t in tickers:
-            try:
-                df = pyupbit.get_ohlcv(t, interval="day", count=1)
-                if df is not None and not df.empty:
-                    rows.append({"market": t, "value": df.iloc[-1]["value"]})
-            except Exception:
-                continue
+        for i in range(0, len(tickers), 100):
+            chunk = tickers[i:i+100]
+            resp = requests.get(
+                "https://api.upbit.com/v1/ticker",
+                params={"markets": ",".join(chunk)},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                for d in resp.json():
+                    rows.append({"market": d["market"], "value": d.get("acc_trade_price_24h", 0)})
         rows.sort(key=lambda x: x["value"], reverse=True)
         return [r["market"] for r in rows[:top_n]]
     except Exception:
         return []
 
 
+def _fetch_one_signal(market: str) -> tuple[str, int]:
+    """단일 마켓 신호 수 계산 (스레드 풀용)"""
+    try:
+        df = pyupbit.get_ohlcv(market, interval=f"minute{cfg.CANDLE_UNIT}", count=60)
+        if df is None or len(df) < 30:
+            return market, 0
+        df.columns = ["open", "high", "low", "close", "volume", "value"]
+        df = add_all_indicators(df, cfg)
+        df = df.dropna()
+        if df.empty:
+            return market, 0
+        return market, get_signal_score(df.iloc[-1], cfg)["score"]
+    except Exception:
+        return market, 0
+
+
 @st.cache_data(ttl=300)
 def _scan_signal_scores(markets: tuple) -> dict:
-    """각 마켓의 매수 신호 수 반환 {market: score}. 5분 캐시."""
+    """각 마켓의 매수 신호 수 반환 {market: score}. 병렬 처리 + 5분 캐시."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     scores = {}
-    for market in markets:
-        try:
-            df = pyupbit.get_ohlcv(market, interval=f"minute{cfg.CANDLE_UNIT}", count=100)
-            if df is None or len(df) < 30:
-                scores[market] = 0
-                continue
-            df.columns = ["open", "high", "low", "close", "volume", "value"]
-            df = add_all_indicators(df, cfg)
-            df = df.dropna()
-            if df.empty:
-                scores[market] = 0
-                continue
-            scores[market] = get_signal_score(df.iloc[-1], cfg)["score"]
-        except Exception:
-            scores[market] = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_fetch_one_signal, m): m for m in markets}
+        for future in as_completed(futures):
+            market, score = future.result()
+            scores[market] = score
     return scores
 
 
