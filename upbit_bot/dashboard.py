@@ -322,10 +322,21 @@ page = st.sidebar.radio(
     ],
 )
 
+@st.cache_data(ttl=3600)
+def _all_krw_markets() -> list:
+    try:
+        markets = pyupbit.get_tickers(fiat="KRW") or []
+        return sorted(markets)
+    except Exception:
+        return ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE"]
+
+_krw_markets = _all_krw_markets()
+_default_idx = _krw_markets.index("KRW-BTC") if "KRW-BTC" in _krw_markets else 0
+
 chart_market = st.sidebar.selectbox(
-    "차트 마켓",
-    ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE", "KRW-PEPE", "KRW-SUI"],
-    index=0,
+    f"차트 마켓 (전체 {len(_krw_markets)}개)",
+    _krw_markets,
+    index=_default_idx,
 )
 
 chart_unit = st.sidebar.selectbox(
