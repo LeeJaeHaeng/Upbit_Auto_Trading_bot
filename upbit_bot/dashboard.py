@@ -379,7 +379,7 @@ def _get_volume_filtered_markets(top_n: int = 50) -> list:
 def _fetch_one_signal(market: str) -> tuple[str, int]:
     """단일 마켓 신호 수 계산 (스레드 풀용)"""
     try:
-        df = pyupbit.get_ohlcv(market, interval=f"minute{cfg.CANDLE_UNIT}", count=60)
+        df = pyupbit.get_ohlcv(market, interval=f"minute{cfg.CANDLE_UNIT}", count=120)
         if df is None or len(df) < 30:
             return market, 0
         df.columns = ["open", "high", "low", "close", "volume", "value"]
@@ -864,8 +864,12 @@ elif page == "실시간 차트 & 지표":
     st.markdown("---")
 
     st.subheader("🎯 현재 매수 신호 요약")
+    st.caption(f"※ 봇 기준 {cfg.CANDLE_UNIT}분봉 기준 (차트 봉 단위와 다를 수 있음)")
 
-    signal_result = get_signal_score(last, cfg)
+    # 봇과 동일한 기준(cfg.CANDLE_UNIT, 120봉)으로 신호 계산 — 차트 봉 단위와 분리
+    _sig_df = load_chart_data(chart_market, cfg.CANDLE_UNIT, count=120)
+    _sig_row = _sig_df.iloc[-1] if not _sig_df.empty else last
+    signal_result = get_signal_score(_sig_row, cfg)
     signals = signal_result["signals"]
     details = signal_result["details"]
 
