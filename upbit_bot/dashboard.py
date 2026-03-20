@@ -1,16 +1,23 @@
 """
 관리자 대시보드 (Streamlit)
 
-실시간 차트 + 기술적 지표 + 시장 환경 지표 + 거래 내역을 시각화합니다.
+실시간 차트 + 기술적 지표 + 시장 환경 지표 + 거래 내역 + 봇 제어 + 뉴스
 
 실행: streamlit run dashboard.py
 """
 
+import os
 import sys
+import re
 import json
+import subprocess
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+import psutil
+import requests
 import streamlit as st
 import pandas as pd
 from env_utils import load_env_file
@@ -19,7 +26,6 @@ load_env_file(Path(__file__).resolve().parent)
 
 import pyupbit
 
-# 프로젝트 모듈
 sys.path.insert(0, str(Path(__file__).parent))
 from indicators import add_all_indicators
 from market_indicators import MarketEnvironment
@@ -33,8 +39,74 @@ st.set_page_config(
 )
 
 import config as cfg
+
 LOG_FILE = cfg.LOG_FILE
 PERFORMANCE_FILE = cfg.PERFORMANCE_FILE
+BOT_PID_FILE = Path(__file__).parent / "bot_pid.json"
+BOT_DIR = Path(__file__).parent
+
+
+# ──────────────────────────────────────
+# 봇 프로세스 제어
+# ──────────────────────────────────────
+
+def _is_pid_running(pid: int) -> bool:
+    """PID로 프로세스 실행 여부 확인 (psutil 사용)"""
+    try:
+        return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def get_bot_status() -> dict:
+    """봇 실행 상태 반환"""
+    if not BOT_PID_FILE.exists():
+        return {"running": False, "pid": None, "mode": None, "started_at": None}
+    try:
+        with open(BOT_PID_FILE, encoding="utf-8") as f:
+            info = json.load(f)
+        pid = info.get("pid")
+        if pid and _is_pid_running(pid):
+            return {"running": True, **info}
+    except Exception:
+        pass
+    BOT_PID_FILE.unlink(missing_ok=True)
+    return {"running": False, "pid": None, "mode": None, "started_at": None}
+
+
+def start_bot(live: bool = False) -> int:
+    """봇 프로세스 시작 — 독립 프로세스 그룹으로 실행"""
+    args = [sys.executable, "main.py"]
+    if live:
+        args.append("--live")
+    proc = subprocess.Popen(
+        args,
+        cwd=str(BOT_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    info = {
+        "pid": proc.pid,
+        "mode": "live" if live else "paper",
+        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(BOT_PID_FILE, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False)
+    return proc.pid
+
+
+def stop_bot(pid: int) -> bool:
+    """봇 프로세스 강제 종료 (Windows taskkill)"""
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/PID", str(pid)],
+            capture_output=True, check=False,
+        )
+    except Exception:
+        pass
+    BOT_PID_FILE.unlink(missing_ok=True)
+    return True
 
 
 # ──────────────────────────────────────
@@ -73,7 +145,6 @@ def get_sell_trades(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=60)
 def load_chart_data(market: str, unit: int = 60, count: int = 200) -> pd.DataFrame:
-    """분봉 차트 데이터를 가져옵니다."""
     df = pyupbit.get_ohlcv(market, interval=f"minute{unit}", count=count)
     if df is None or df.empty:
         return pd.DataFrame()
@@ -84,9 +155,108 @@ def load_chart_data(market: str, unit: int = 60, count: int = 200) -> pd.DataFra
 
 @st.cache_data(ttl=300)
 def load_market_environment(market: str) -> dict:
-    """시장 환경 지표를 가져옵니다."""
     env = MarketEnvironment()
     return env.get_market_score(market)
+
+
+# ──────────────────────────────────────
+# 뉴스 크롤링
+# ──────────────────────────────────────
+
+RSS_FEEDS = [
+    {"name": "CoinDesk",          "emoji": "🇺🇸", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"},
+    {"name": "CoinTelegraph",     "emoji": "📰", "url": "https://cointelegraph.com/rss"},
+    {"name": "Bitcoin Magazine",  "emoji": "₿",  "url": "https://bitcoinmagazine.com/feed"},
+    {"name": "Decrypt",           "emoji": "🔓", "url": "https://decrypt.co/feed"},
+    {"name": "BlockMedia (KR)",   "emoji": "🇰🇷", "url": "https://www.blockmedia.co.kr/feed"},
+    {"name": "코인리더스 (KR)",   "emoji": "🇰🇷", "url": "https://www.coinreaders.com/feed"},
+]
+
+
+@st.cache_data(ttl=300)
+def fetch_crypto_news() -> list:
+    """여러 RSS 피드에서 암호화폐 뉴스를 수집 후 날짜순 정렬"""
+    news = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        )
+    }
+
+    for feed in RSS_FEEDS:
+        try:
+            resp = requests.get(feed["url"], headers=headers, timeout=10)
+            if resp.status_code != 200:
+                continue
+
+            # XML 파싱 (RSS 2.0 / Atom 공통 처리)
+            root = ET.fromstring(resp.content)
+            channel = root.find("channel")
+            items = channel.findall("item") if channel is not None else []
+
+            # Atom 피드 fallback
+            if not items:
+                ns_atom = "http://www.w3.org/2005/Atom"
+                items = root.findall(f"{{{ns_atom}}}entry")
+
+            for item in items[:6]:
+                title = (
+                    item.findtext("title")
+                    or item.findtext("{http://www.w3.org/2005/Atom}title")
+                    or ""
+                ).strip()
+
+                link_el = item.find("link")
+                if link_el is not None and link_el.text:
+                    link = link_el.text.strip()
+                elif link_el is not None:
+                    link = link_el.get("href", "").strip()
+                else:
+                    link = (item.findtext("{http://www.w3.org/2005/Atom}link") or "").strip()
+
+                pub = (
+                    item.findtext("pubDate")
+                    or item.findtext("{http://www.w3.org/2005/Atom}published")
+                    or item.findtext("{http://www.w3.org/2005/Atom}updated")
+                    or ""
+                ).strip()
+
+                desc = (
+                    item.findtext("description")
+                    or item.findtext("{http://www.w3.org/2005/Atom}summary")
+                    or item.findtext("{http://www.w3.org/2005/Atom}content")
+                    or ""
+                ).strip()
+
+                # HTML 태그 제거 및 길이 제한
+                desc = re.sub(r"<[^>]+>", "", desc)
+                desc = re.sub(r"\s+", " ", desc).strip()[:280]
+
+                # 날짜 파싱
+                try:
+                    dt = parsedate_to_datetime(pub)
+                    date_str = dt.strftime("%Y-%m-%d %H:%M")
+                    sort_key = dt.timestamp()
+                except Exception:
+                    date_str = pub[:16] if len(pub) >= 10 else pub
+                    sort_key = 0
+
+                if title and link:
+                    news.append({
+                        "source": f"{feed['emoji']} {feed['name']}",
+                        "title": title,
+                        "link": link,
+                        "date": date_str,
+                        "summary": desc,
+                        "_sort_key": sort_key,
+                    })
+        except Exception:
+            continue
+
+    news.sort(key=lambda x: x["_sort_key"], reverse=True)
+    return news
 
 
 # ──────────────────────────────────────
@@ -96,9 +266,52 @@ def load_market_environment(market: str) -> dict:
 st.sidebar.title("📊 자동매매 대시보드")
 st.sidebar.markdown("---")
 
+# ── 봇 제어 패널 ──
+st.sidebar.subheader("🤖 봇 제어")
+
+bot_status = get_bot_status()
+
+if bot_status["running"]:
+    mode_label = "🔴 실거래" if bot_status.get("mode") == "live" else "🟡 페이퍼"
+    st.sidebar.success(f"**실행 중** {mode_label}")
+    st.sidebar.caption(
+        f"PID: {bot_status['pid']} | 시작: {bot_status.get('started_at', '-')}"
+    )
+    if st.sidebar.button("⏹ 봇 종료", type="primary", use_container_width=True):
+        stop_bot(bot_status["pid"])
+        st.sidebar.warning("봇이 종료되었습니다.")
+        st.rerun()
+else:
+    st.sidebar.error("**정지 중**")
+    trading_mode = st.sidebar.radio(
+        "모드 선택",
+        ["페이퍼 트레이딩 (모의)", "실거래 (실제 자금)"],
+        index=0,
+    )
+    is_live = trading_mode == "실거래 (실제 자금)"
+
+    if is_live:
+        st.sidebar.warning("⚠️ 실거래 모드: 실제 자금이 사용됩니다!")
+        live_confirm = st.sidebar.checkbox("실거래 시작에 동의합니다")
+    else:
+        live_confirm = True
+
+    if st.sidebar.button(
+        "▶ 봇 시작",
+        type="primary",
+        use_container_width=True,
+        disabled=(is_live and not live_confirm),
+    ):
+        pid = start_bot(live=is_live)
+        st.sidebar.success(f"봇이 시작되었습니다! (PID: {pid})")
+        st.rerun()
+
+st.sidebar.markdown("---")
+
+# ── 페이지 선택 ──
 page = st.sidebar.radio(
     "페이지",
-    ["실시간 차트 & 지표", "거래 내역 & 성과"],
+    ["실시간 차트 & 지표", "거래 내역 & 성과", "📰 비트코인 뉴스"],
 )
 
 chart_market = st.sidebar.selectbox(
@@ -131,7 +344,6 @@ if page == "실시간 차트 & 지표":
         st.error("차트 데이터를 불러올 수 없습니다.")
         st.stop()
 
-    # ── 현재 상태 KPI ──
     last = chart_df.iloc[-1]
     prev = chart_df.iloc[-2]
     change_pct = (last["close"] - prev["close"]) / prev["close"] * 100
@@ -150,16 +362,11 @@ if page == "실시간 차트 & 지표":
 
     st.markdown("---")
 
-    # ══════════════════════════════════════
-    # 가격 차트 + 볼린저 밴드 + EMA
-    # ══════════════════════════════════════
-
     st.subheader("가격 차트 (볼린저 밴드 + EMA)")
     price_chart_df = chart_df[["close", "bb_upper", "bb_middle", "bb_lower", "ema_short", "ema_long"]].copy()
     price_chart_df.columns = ["종가", "BB 상단", "BB 중간", "BB 하단", f"EMA {cfg.EMA_SHORT}", f"EMA {cfg.EMA_LONG}"]
     st.line_chart(price_chart_df, use_container_width=True, height=400)
 
-    # ── 보조지표 차트들 ──
     col_ind1, col_ind2 = st.columns(2)
 
     with col_ind1:
@@ -201,10 +408,6 @@ if page == "실시간 차트 & 지표":
 
     st.markdown("---")
 
-    # ══════════════════════════════════════
-    # 시장 환경 지표 (기술적 지표 외 매개변수)
-    # ══════════════════════════════════════
-
     st.subheader("📡 시장 환경 지표 (기술적 지표 외)")
 
     env_data = load_market_environment(chart_market)
@@ -213,7 +416,6 @@ if page == "실시간 차트 & 지표":
     env_col1, env_col2 = st.columns(2)
 
     with env_col1:
-        # 공포탐욕 + 종합 점수
         fgi = d["fear_greed"]
         score = env_data["score"]
 
@@ -234,7 +436,6 @@ if page == "실시간 차트 & 지표":
         st.write(f"**판단:** {env_data['recommendation']}")
 
     with env_col2:
-        # 김치 프리미엄 + 호가 + 거래량
         kimchi = d["kimchi_premium"]
         ob = d["orderbook_pressure"]
         vol = d["volume_trend"]
@@ -257,10 +458,6 @@ if page == "실시간 차트 & 지표":
         st.write(f"{vol_color} **{vr:.2f}x** — {vol['signal']}")
 
     st.markdown("---")
-
-    # ══════════════════════════════════════
-    # 신호 요약
-    # ══════════════════════════════════════
 
     st.subheader("🎯 현재 매수 신호 요약")
 
@@ -307,7 +504,6 @@ elif page == "거래 내역 & 성과":
 
     st.markdown("---")
 
-    # ── KPI ──
     total_trades = len(sell_df)
     winning = sell_df[sell_df["pnl_krw"] >= 0] if not sell_df.empty else pd.DataFrame()
     losing = sell_df[sell_df["pnl_krw"] < 0] if not sell_df.empty else pd.DataFrame()
@@ -329,7 +525,6 @@ elif page == "거래 내역 & 성과":
 
     st.markdown("---")
 
-    # ── 수익 차트 ──
     col_chart1, col_chart2 = st.columns(2)
 
     with col_chart1:
@@ -347,7 +542,6 @@ elif page == "거래 내역 & 성과":
 
     st.markdown("---")
 
-    # ── 기간별 분석 ──
     if view_mode in ("일별", "전체") and not sell_df.empty:
         st.subheader("📅 일별 수익")
         daily = sell_df.groupby("date").agg(
@@ -384,7 +578,6 @@ elif page == "거래 내역 & 성과":
 
     st.markdown("---")
 
-    # ── 코인별 / 시간대별 ──
     col_m, col_h = st.columns(2)
 
     with col_m:
@@ -411,7 +604,6 @@ elif page == "거래 내역 & 성과":
 
     st.markdown("---")
 
-    # ── 전체 거래 내역 ──
     st.subheader("📋 전체 거래 내역")
     sort_order = st.radio("정렬", ["최신순", "오래된순"], horizontal=True, key="sort_trade")
     display_df = trade_df.sort_values("timestamp", ascending=(sort_order == "오래된순")).copy()
@@ -421,7 +613,6 @@ elif page == "거래 내역 & 성과":
                     if c in display_df.columns]
     st.dataframe(display_df[default_cols], use_container_width=True, height=500)
 
-    # ── 리스크 지표 ──
     if not sell_df.empty:
         st.markdown("---")
         st.subheader("📈 리스크 지표")
@@ -455,6 +646,76 @@ elif page == "거래 내역 & 성과":
             mdd = (cumulative_pnl - peak).min()
             st.write(f"- MDD: {mdd:+,.0f}원")
 
-# ── 푸터 ──
+
+# ══════════════════════════════════════════════════════════════
+# 페이지 3: 비트코인 뉴스
+# ══════════════════════════════════════════════════════════════
+
+elif page == "📰 비트코인 뉴스":
+    st.title("📰 최신 암호화폐 뉴스")
+    st.caption("주요 미디어 RSS 피드에서 실시간 수집 · 5분 자동 캐시 갱신")
+
+    col_top1, col_top2 = st.columns([3, 1])
+    with col_top2:
+        if st.button("🔄 뉴스 새로고침", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    with st.spinner("뉴스를 불러오는 중..."):
+        news_items = fetch_crypto_news()
+
+    if not news_items:
+        st.error(
+            "뉴스를 불러오지 못했습니다. 네트워크 연결 또는 피드 URL을 확인하세요.\n\n"
+            "일부 피드는 한국 IP에서 접근이 제한될 수 있습니다."
+        )
+        st.stop()
+
+    # 소스 필터
+    sources = sorted({n["source"] for n in news_items})
+    selected_sources = st.multiselect(
+        "소스 필터 (미선택 시 전체)",
+        sources,
+        default=[],
+        placeholder="소스를 선택하세요...",
+    )
+    if selected_sources:
+        news_items = [n for n in news_items if n["source"] in selected_sources]
+
+    st.markdown(f"**총 {len(news_items)}개** 뉴스 수집됨")
+    st.markdown("---")
+
+    # 뉴스 카드 출력 (2열)
+    for i in range(0, len(news_items), 2):
+        cols = st.columns(2)
+        for j, col in enumerate(cols):
+            idx = i + j
+            if idx >= len(news_items):
+                break
+            item = news_items[idx]
+            with col:
+                with st.container(border=True):
+                    st.markdown(
+                        f"**[{item['title']}]({item['link']})**"
+                    )
+                    meta_col1, meta_col2 = st.columns([1, 1])
+                    meta_col1.caption(f"📌 {item['source']}")
+                    meta_col2.caption(f"🕐 {item['date']}")
+                    if item["summary"]:
+                        st.markdown(
+                            f"<div style='font-size:0.88rem; color:#888; line-height:1.5;'>"
+                            f"{item['summary']}{'...' if len(item['summary']) >= 280 else ''}"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+    st.markdown("---")
+    st.caption(
+        "출처: CoinDesk · CoinTelegraph · Bitcoin Magazine · Decrypt · BlockMedia · 코인리더스 | "
+        f"마지막 수집: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+
+# ── 공통 푸터 ──
 st.markdown("---")
 st.caption(f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
