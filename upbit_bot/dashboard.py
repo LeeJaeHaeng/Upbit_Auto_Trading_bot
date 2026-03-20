@@ -826,121 +826,194 @@ elif page == "💰 내 업비트 지갑":
     st_autorefresh(interval=30_000, key="wallet_refresh")
 
     st.title("💰 내 업비트 지갑 현황")
-    st.caption("업비트 API 키로 실시간 잔고를 조회합니다. 30초마다 자동 갱신.")
+
+    col_hd1, col_hd2 = st.columns([4, 1])
+    with col_hd2:
+        if st.button("🔄 새로고침", use_container_width=True):
+            st.rerun()
 
     access_key = getattr(cfg, "ACCESS_KEY", "YOUR_ACCESS_KEY")
     secret_key = getattr(cfg, "SECRET_KEY", "YOUR_SECRET_KEY")
 
     if access_key in ("YOUR_ACCESS_KEY", "", None):
-        st.error(
-            "API 키가 설정되어 있지 않습니다.\n\n"
-            "`upbit_bot/.env` 파일에 `UPBIT_ACCESS_KEY` 와 `UPBIT_SECRET_KEY` 를 입력하세요."
-        )
-        st.code(
-            "UPBIT_ACCESS_KEY=your_access_key_here\n"
-            "UPBIT_SECRET_KEY=your_secret_key_here",
-            language="bash",
-        )
+        st.error("API 키가 설정되어 있지 않습니다. `upbit_bot/.env` 에 키를 입력하세요.")
+        st.code("UPBIT_ACCESS_KEY=...\nUPBIT_SECRET_KEY=...", language="bash")
         st.stop()
 
-    try:
-        upbit_obj = pyupbit.Upbit(access_key, secret_key)
-        balances_raw = upbit_obj.get_balances()
-    except Exception as e:
-        st.error(f"업비트 API 연결 실패: {e}\n\nAPI 키 및 IP 허용 설정을 확인하세요.")
+    # ── 잔고 조회 ──
+    with st.spinner("업비트 잔고 조회 중..."):
+        try:
+            _upbit = pyupbit.Upbit(access_key, secret_key)
+            _balances_raw = _upbit.get_balances()
+        except Exception as _e:
+            st.error(f"API 연결 실패: {_e}")
+            st.stop()
+
+    if not _balances_raw:
+        st.warning("잔고 정보를 가져오지 못했습니다.")
         st.stop()
 
-    if not balances_raw:
-        st.warning("잔고 정보를 가져오지 못했습니다. API 권한을 확인하세요.")
-        st.stop()
+    # ── 현재가 조회: 유효한 KRW 마켓만 배치 조회, 없는 코인은 개별 처리 ──
+    _valid_krw_markets = set(pyupbit.get_tickers(fiat="KRW") or [])
+    _coin_currencies = [
+        b["currency"] for b in _balances_raw
+        if b.get("currency") != "KRW"
+        and (float(b.get("balance") or 0) + float(b.get("locked") or 0)) > 0
+    ]
+    _batch_markets = [f"KRW-{c}" for c in _coin_currencies if f"KRW-{c}" in _valid_krw_markets]
+    _prices: dict = {}
+    if _batch_markets:
+        try:
+            _price_result = pyupbit.get_current_price(_batch_markets)
+            if isinstance(_price_result, dict):
+                _prices = _price_result
+            elif isinstance(_price_result, (int, float)) and len(_batch_markets) == 1:
+                _prices = {_batch_markets[0]: _price_result}
+        except Exception:
+            # 배치 실패 시 개별 조회
+            for _m in _batch_markets:
+                try:
+                    _p = pyupbit.get_current_price(_m)
+                    if _p:
+                        _prices[_m] = _p
+                except Exception:
+                    pass
 
     # ── 잔고 파싱 ──
     rows = []
+    dust_rows = []
     total_krw_equiv = 0.0
+    DUST_THRESHOLD = 100  # 100원 미만은 먼지로 분류
 
-    for b in balances_raw:
+    for b in _balances_raw:
         currency = b.get("currency", "")
-        balance = float(b.get("balance") or 0)
-        locked = float(b.get("locked") or 0)
-        avg_buy_price = float(b.get("avg_buy_price") or 0)
+        balance  = float(b.get("balance")       or 0)
+        locked   = float(b.get("locked")        or 0)
+        avg_buy  = float(b.get("avg_buy_price") or 0)
         total_qty = balance + locked
 
         if total_qty <= 0:
             continue
 
         if currency == "KRW":
-            current_price = 1.0
-            eval_krw = total_qty
-            pnl_pct = 0.0
-            pnl_krw = 0.0
+            eval_krw    = total_qty
+            cur_price   = 1.0
+            pnl_krw     = 0.0
+            pnl_pct     = 0.0
         else:
-            market = f"KRW-{currency}"
-            current_price = pyupbit.get_current_price(market) or 0.0
-            eval_krw = total_qty * current_price
-            if avg_buy_price > 0 and current_price > 0:
-                pnl_pct = (current_price - avg_buy_price) / avg_buy_price * 100
-                pnl_krw = (current_price - avg_buy_price) * total_qty
+            market    = f"KRW-{currency}"
+            cur_price = _prices.get(market) or 0.0
+            eval_krw  = total_qty * cur_price
+            if avg_buy > 0 and cur_price > 0:
+                pnl_pct = (cur_price - avg_buy) / avg_buy * 100
+                pnl_krw = (cur_price - avg_buy) * total_qty
             else:
                 pnl_pct = 0.0
                 pnl_krw = 0.0
 
         total_krw_equiv += eval_krw
-        rows.append({
-            "코인": currency,
-            "보유 수량": total_qty,
-            "잠금 수량": locked,
-            "평균 매수가": avg_buy_price,
-            "현재가": current_price,
-            "평가금액 (KRW)": eval_krw,
-            "평가손익 (KRW)": pnl_krw,
-            "수익률 (%)": pnl_pct,
-        })
 
-    wallet_df = pd.DataFrame(rows)
+        row = {
+            "코인":            currency,
+            "보유 수량":       total_qty,
+            "잠금 수량":       locked,
+            "평균 매수가":     avg_buy,
+            "현재가":          cur_price,
+            "평가금액(KRW)":   eval_krw,
+            "평가손익(KRW)":   pnl_krw,
+            "수익률(%)":       pnl_pct,
+        }
+
+        if currency == "KRW" or eval_krw >= DUST_THRESHOLD:
+            rows.append(row)
+        else:
+            dust_rows.append(row)
+
+    # ── KRW / 코인 분리 ──
+    all_rows_df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    krw_balance  = 0.0
+    coin_eval    = 0.0
+
+    if not all_rows_df.empty:
+        krw_ser     = all_rows_df[all_rows_df["코인"] == "KRW"]["평가금액(KRW)"]
+        krw_balance = float(krw_ser.values[0]) if not krw_ser.empty else 0.0
+        coin_df     = all_rows_df[all_rows_df["코인"] != "KRW"].copy()
+        coin_eval   = float(coin_df["평가금액(KRW)"].sum()) if not coin_df.empty else 0.0
+    else:
+        coin_df = pd.DataFrame()
 
     # ── 총 자산 KPI ──
-    krw_row = wallet_df[wallet_df["코인"] == "KRW"]
-    krw_balance = krw_row["평가금액 (KRW)"].values[0] if not krw_row.empty else 0.0
-    coin_eval = total_krw_equiv - krw_balance
+    w1, w2, w3, w4 = st.columns(4)
+    w1.metric("💼 총 평가금액",   f"{total_krw_equiv:,.0f} 원")
+    w2.metric("💵 KRW 잔고",      f"{krw_balance:,.0f} 원")
+    w3.metric("🪙 코인 평가액",   f"{coin_eval:,.0f} 원")
+    total_pnl_krw = coin_df["평가손익(KRW)"].sum() if not coin_df.empty else 0.0
+    w4.metric(
+        "📈 보유 코인 손익",
+        f"{total_pnl_krw:+,.0f} 원",
+        delta_color="normal",
+    )
 
-    w1, w2, w3 = st.columns(3)
-    w1.metric("총 평가금액", f"{total_krw_equiv:,.0f} 원")
-    w2.metric("KRW 잔고", f"{krw_balance:,.0f} 원")
-    w3.metric("코인 평가액", f"{coin_eval:,.0f} 원")
-
+    st.caption(f"조회 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 30초마다 자동 갱신")
     st.markdown("---")
 
-    # ── 코인별 보유 현황 테이블 ──
-    st.subheader("보유 자산 현황")
-    coin_df = wallet_df[wallet_df["코인"] != "KRW"].copy() if len(wallet_df) > 1 else pd.DataFrame()
+    # ── 보유 코인 테이블 ──
+    st.subheader("📋 보유 코인 현황")
 
     if not coin_df.empty:
-        display_wallet = coin_df[[
-            "코인", "보유 수량", "평균 매수가", "현재가",
-            "평가금액 (KRW)", "평가손익 (KRW)", "수익률 (%)"
-        ]].copy()
-        display_wallet["평균 매수가"]     = display_wallet["평균 매수가"].map(lambda x: f"{x:,.0f}")
-        display_wallet["현재가"]          = display_wallet["현재가"].map(lambda x: f"{x:,.0f}")
-        display_wallet["평가금액 (KRW)"]  = display_wallet["평가금액 (KRW)"].map(lambda x: f"{x:,.0f}")
-        display_wallet["평가손익 (KRW)"]  = display_wallet["평가손익 (KRW)"].map(lambda x: f"{x:+,.0f}")
-        display_wallet["수익률 (%)"]      = display_wallet["수익률 (%)"].map(lambda x: f"{x:+.2f}%")
-        display_wallet["보유 수량"]       = display_wallet["보유 수량"].map(lambda x: f"{x:.8f}".rstrip("0").rstrip("."))
+        disp = coin_df[[
+            "코인", "보유 수량", "잠금 수량",
+            "평균 매수가", "현재가",
+            "평가금액(KRW)", "평가손익(KRW)", "수익률(%)"
+        ]].copy().sort_values("평가금액(KRW)", ascending=False)
 
-        st.dataframe(display_wallet, use_container_width=True, hide_index=True)
+        # 숫자 포맷팅
+        disp["보유 수량"]     = disp["보유 수량"].apply(lambda x: f"{x:.8f}".rstrip("0").rstrip("."))
+        disp["잠금 수량"]     = disp["잠금 수량"].apply(lambda x: f"{x:.8f}".rstrip("0").rstrip(".") if x > 0 else "-")
+        disp["평균 매수가"]   = disp["평균 매수가"].apply(lambda x: f"{x:,.2f}" if x > 0 else "-")
+        disp["현재가"]        = disp["현재가"].apply(lambda x: f"{x:,.2f}" if x > 0 else "-")
+        disp["평가금액(KRW)"] = disp["평가금액(KRW)"].apply(lambda x: f"{x:,.0f}")
+        disp["평가손익(KRW)"] = disp["평가손익(KRW)"].apply(lambda x: f"{x:+,.0f}")
+        disp["수익률(%)"]     = disp["수익률(%)"].apply(lambda x: f"{x:+.2f}%")
 
-        # ── 코인 비중 차트 ──
-        st.subheader("자산 구성 비중")
-        pie_df = pd.DataFrame({
-            "자산": ["KRW"] + coin_df["코인"].tolist(),
-            "평가액": [krw_balance] + coin_df["평가금액 (KRW)"].tolist(),
-        }).set_index("자산")
-        st.bar_chart(pie_df, use_container_width=True, height=300)
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        # ── 자산 구성 바 차트 ──
+        st.subheader("📊 자산 구성")
+        chart_data = {"KRW": krw_balance}
+        for _, r in coin_df.iterrows():
+            if r["평가금액(KRW)"] > 0:
+                chart_data[r["코인"]] = r["평가금액(KRW)"]
+        chart_df = pd.DataFrame.from_dict(
+            chart_data, orient="index", columns=["평가금액(원)"]
+        ).sort_values("평가금액(원)", ascending=False)
+        st.bar_chart(chart_df, use_container_width=True, height=280)
+
     else:
-        st.info("보유 중인 코인이 없습니다. KRW만 보유 중입니다.")
+        st.info("현재 보유 중인 코인이 없습니다. (100원 이상 평가액 기준)")
 
-    # ── KRW 잔고 별도 표시 ──
+    # ── KRW 상세 ──
     st.markdown("---")
-    st.caption(f"원화(KRW) 잔고: **{krw_balance:,.0f}원** | 조회 시각: {datetime.now().strftime('%H:%M:%S')}")
+    krw_col1, krw_col2 = st.columns(2)
+    with krw_col1:
+        st.subheader("💵 원화(KRW) 상세")
+        # 원화 행에서 locked도 확인
+        krw_raw = next((b for b in _balances_raw if b.get("currency") == "KRW"), {})
+        krw_avail  = float(krw_raw.get("balance") or 0)
+        krw_locked = float(krw_raw.get("locked")  or 0)
+        st.write(f"- 사용 가능: **{krw_avail:,.0f} 원**")
+        if krw_locked > 0:
+            st.write(f"- 주문 중(잠금): **{krw_locked:,.0f} 원**")
+        st.write(f"- 합계: **{krw_avail + krw_locked:,.0f} 원**")
+
+    with krw_col2:
+        if dust_rows:
+            st.subheader("🌫️ 소액 잔고 (먼지)")
+            st.caption("100원 미만 평가액 코인 — 거래 불가 수준의 잔여 수량")
+            dust_df = pd.DataFrame(dust_rows)[["코인", "보유 수량", "평가금액(KRW)"]]
+            dust_df["보유 수량"]     = dust_df["보유 수량"].apply(lambda x: f"{x:.8f}".rstrip("0"))
+            dust_df["평가금액(KRW)"] = dust_df["평가금액(KRW)"].apply(lambda x: f"{x:.4f} 원")
+            st.dataframe(dust_df, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════
