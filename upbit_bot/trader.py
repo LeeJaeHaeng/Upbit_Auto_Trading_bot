@@ -69,6 +69,10 @@ class Trader:
         # DB 세션 ID (봇 실행마다 고유, 거래 기록 연결용)
         mode = 'paper' if config.PAPER_TRADING else 'live'
         self._db_session_id = _bdb.start_trading_session(mode, config)
+        _bdb.record_balance(
+            session_id=self._db_session_id, trigger='startup', mode=mode,
+            krw_balance=self.paper_capital, note='봇 시작',
+        )
 
         # 동적 조정 카운터 (매 N사이클마다 익절/손절 재평가)
         self.adjust_counter = 0
@@ -464,6 +468,15 @@ class Trader:
         )
 
         print(f"\n🟢 매수 체결! | {market} | 가격={fmt_price(self.entry_price)} | 수량={self.coin_qty:.8f}")
+        _bdb.record_balance(
+            session_id=self._db_session_id, trigger='buy',
+            mode='paper' if self.config.PAPER_TRADING else 'live',
+            krw_balance=self.paper_capital,
+            coin_market=market,
+            coin_qty=self.coin_qty,
+            coin_value_krw=self.entry_price * self.coin_qty,
+            note=f'매수 {market} {self.entry_price:,.0f}원',
+        )
 
         # 즉시 익절/손절 매도 주문 설정
         tp_price = entry_info["tp_price"]
@@ -793,6 +806,20 @@ class Trader:
         )
         if self.config.PAPER_TRADING:
             print(f"   💰 페이퍼 잔고: {self.paper_capital:,.0f}원")
+        if not self.config.PAPER_TRADING:
+            try:
+                _live_balances = self.client.upbit.get_balances()
+                _krw_live = next((float(b['balance']) for b in (_live_balances or []) if b['currency'] == 'KRW'), self.paper_capital)
+            except Exception:
+                _krw_live = self.paper_capital
+        else:
+            _krw_live = self.paper_capital
+        _bdb.record_balance(
+            session_id=self._db_session_id, trigger='sell',
+            mode='paper' if self.config.PAPER_TRADING else 'live',
+            krw_balance=_krw_live,
+            note=f'{reason}',
+        )
 
         # 상태 초기화
         self.state = STATE_IDLE
@@ -1064,6 +1091,12 @@ class Trader:
                 print("  ℹ️ 기존 지정가 매도 주문은 유지됩니다.")
 
         self.trade_logger.print_summary()
+        _bdb.record_balance(
+            session_id=self._db_session_id, trigger='shutdown',
+            mode='paper' if self.config.PAPER_TRADING else 'live',
+            krw_balance=self.paper_capital,
+            note='봇 종료',
+        )
         _bdb.end_trading_session(
             self._db_session_id,
             self.trade_logger.performance,

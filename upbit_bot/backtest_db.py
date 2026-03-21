@@ -130,6 +130,22 @@ def init_db():
             ema_long       REAL,
             close_price    REAL
         );
+
+        -- 잔고 스냅샷 (거래 체결 + 봇 시작/종료 시 저장)
+        CREATE TABLE IF NOT EXISTS balance_snapshots (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id      INTEGER REFERENCES trading_sessions(id),
+            snapshot_at     TEXT NOT NULL,
+            trigger         TEXT NOT NULL,   -- startup|buy|sell|shutdown|periodic
+            mode            TEXT NOT NULL,   -- paper|live
+            krw_balance     REAL,
+            coin_market     TEXT,
+            coin_qty        REAL,
+            coin_value_krw  REAL,
+            total_asset_krw REAL,
+            unrealized_pct  REAL,
+            note            TEXT
+        );
         """)
 
 
@@ -522,4 +538,53 @@ def get_indicator_win_analysis() -> list[dict]:
             WHERE r.action = 'SELL'
             ORDER BY r.timestamp DESC""",
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_balance(
+    session_id: int,
+    trigger: str,
+    mode: str,
+    krw_balance: float,
+    coin_market: str = None,
+    coin_qty: float = None,
+    coin_value_krw: float = None,
+    unrealized_pct: float = None,
+    note: str = None,
+):
+    """잔고 스냅샷 저장.
+
+    trigger: 'startup' | 'buy' | 'sell' | 'shutdown' | 'periodic'
+    """
+    init_db()
+    total = (krw_balance or 0) + (coin_value_krw or 0)
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO balance_snapshots
+                (session_id, snapshot_at, trigger, mode,
+                 krw_balance, coin_market, coin_qty, coin_value_krw,
+                 total_asset_krw, unrealized_pct, note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                session_id, datetime.now().isoformat(), trigger, mode,
+                krw_balance, coin_market, coin_qty, coin_value_krw,
+                total, unrealized_pct, note,
+            ),
+        )
+
+
+def list_balance_snapshots(session_id: int = None, limit: int = 100) -> list[dict]:
+    init_db()
+    with _connect() as conn:
+        if session_id:
+            rows = conn.execute(
+                """SELECT * FROM balance_snapshots WHERE session_id=?
+                ORDER BY snapshot_at DESC LIMIT ?""",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM balance_snapshots ORDER BY snapshot_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
     return [dict(r) for r in rows]
