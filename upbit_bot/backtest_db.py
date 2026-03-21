@@ -138,12 +138,12 @@ def init_db():
             snapshot_at     TEXT NOT NULL,
             trigger         TEXT NOT NULL,   -- startup|buy|sell|shutdown|periodic
             mode            TEXT NOT NULL,   -- paper|live
-            krw_balance     REAL,
+            krw_balance     INTEGER,         -- KRW 현금 잔고 (원, 소수점 없음)
             coin_market     TEXT,
-            coin_qty        REAL,
-            coin_value_krw  REAL,
-            total_asset_krw REAL,
-            unrealized_pct  REAL,
+            coin_qty        REAL,            -- 코인 수량 (소수점 유지)
+            coin_value_krw  INTEGER,         -- 코인 평가액 (원, 소수점 없음)
+            total_asset_krw INTEGER,         -- 총 자산 (원, 소수점 없음)
+            unrealized_pct  REAL,            -- 미실현 손익 %
             note            TEXT
         );
         """)
@@ -268,11 +268,11 @@ def save_backtest(results: dict, config) -> int:
                 capital     -= t.get("amount_krw", 0)
                 coin_qty     = t.get("coin_qty", 0)
                 last_entry   = t.get("price", 0)
-                coin_val     = coin_qty * last_entry
-                total_asset  = capital + coin_val
+                coin_val     = round(coin_qty * last_entry)
+                total_asset  = round(capital) + coin_val
                 snap_rows.append((
                     sess_id, ts, "buy", "backtest",
-                    capital, market, coin_qty, coin_val, total_asset,
+                    round(capital), market, coin_qty, coin_val, total_asset,
                     0.0, f"백테스트 매수 신호점수={t.get('signal_score',0)}",
                 ))
             elif t_type == "SELL":
@@ -282,7 +282,7 @@ def save_backtest(results: dict, config) -> int:
                 pnl_pct  = t.get("pnl_pct", 0)
                 snap_rows.append((
                     sess_id, ts, "sell", "backtest",
-                    capital, None, 0.0, 0.0, capital,
+                    round(capital), None, 0.0, 0, round(capital),
                     pnl_pct, f"백테스트 매도 {t.get('reason','')} {pnl_pct:+.2f}%",
                 ))
                 coin_qty = 0.0
@@ -626,12 +626,14 @@ def record_balance(
     unrealized_pct: float = None,
     note: str = None,
 ):
-    """잔고 스냅샷 저장.
+    """잔고 스냅샷 저장. KRW 금액은 소수점 없이 정수로 저장.
 
     trigger: 'startup' | 'buy' | 'sell' | 'shutdown' | 'periodic'
     """
     init_db()
-    total = (krw_balance or 0) + (coin_value_krw or 0)
+    krw_int   = round(krw_balance or 0)
+    coin_int  = round(coin_value_krw or 0)
+    total_int = krw_int + coin_int
     with _connect() as conn:
         conn.execute(
             """INSERT INTO balance_snapshots
@@ -641,8 +643,8 @@ def record_balance(
             VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 session_id, datetime.now().isoformat(), trigger, mode,
-                krw_balance, coin_market, coin_qty, coin_value_krw,
-                total, unrealized_pct, note,
+                krw_int, coin_market, coin_qty, coin_int,
+                total_int, unrealized_pct, note,
             ),
         )
 
