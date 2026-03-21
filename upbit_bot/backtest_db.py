@@ -223,7 +223,81 @@ def save_backtest(results: dict, config) -> int:
                 for t in trades
             ])
 
-    print(f"[DB] 백테스트 결과 저장 완료 → backtest_history.db (run_id={run_id})")
+    # ── trading_sessions에 백테스트 세션 등록 + 거래별 잔고 스냅샷 저장 ──
+    market    = results["market"]
+    init_cap  = results.get("initial_capital", 1_000_000)
+    total_t   = results.get("total_trades", 0)
+    wins      = results.get("winning_trades", 0)
+    loses     = results.get("losing_trades", 0)
+    wr        = results.get("win_rate_pct", 0)
+    pnl       = results.get("total_pnl_krw", 0)
+    ret       = results.get("total_return_pct", 0)
+    final_cap = results.get("final_capital", init_cap)
+
+    raw_trades = results.get("trades", [])
+
+    with _connect() as conn:
+        # 세션 생성
+        s_cur = conn.execute(
+            """INSERT INTO trading_sessions
+                (started_at, ended_at, mode, config_json,
+                 total_trades, win_trades, lose_trades, win_rate_pct,
+                 total_pnl_krw, total_return_pct, initial_capital, final_capital)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                datetime.now().isoformat(),
+                datetime.now().isoformat(),
+                "backtest",
+                cfg_json,
+                total_t, wins, loses, wr, pnl, ret, init_cap, final_cap,
+            ),
+        )
+        sess_id = s_cur.lastrowid
+
+        # 거래별 balance_snapshots 재현 (trades 목록 순회)
+        capital   = init_cap
+        coin_qty  = 0.0
+        last_entry = 0.0
+        snap_rows  = []
+
+        for t in raw_trades:
+            t_type = t.get("type", "")
+            ts     = str(t.get("datetime", ""))
+
+            if t_type == "BUY":
+                capital     -= t.get("amount_krw", 0)
+                coin_qty     = t.get("coin_qty", 0)
+                last_entry   = t.get("price", 0)
+                coin_val     = coin_qty * last_entry
+                total_asset  = capital + coin_val
+                snap_rows.append((
+                    sess_id, ts, "buy", "backtest",
+                    capital, market, coin_qty, coin_val, total_asset,
+                    0.0, f"백테스트 매수 신호점수={t.get('signal_score',0)}",
+                ))
+            elif t_type == "SELL":
+                exit_p   = t.get("price", 0)
+                sell_val = coin_qty * exit_p - t.get("fee", 0)
+                capital += sell_val
+                pnl_pct  = t.get("pnl_pct", 0)
+                snap_rows.append((
+                    sess_id, ts, "sell", "backtest",
+                    capital, None, 0.0, 0.0, capital,
+                    pnl_pct, f"백테스트 매도 {t.get('reason','')} {pnl_pct:+.2f}%",
+                ))
+                coin_qty = 0.0
+
+        if snap_rows:
+            conn.executemany(
+                """INSERT INTO balance_snapshots
+                    (session_id, snapshot_at, trigger, mode,
+                     krw_balance, coin_market, coin_qty, coin_value_krw,
+                     total_asset_krw, unrealized_pct, note)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                snap_rows,
+            )
+
+    print(f"[DB] 백테스트 결과 저장 완료 → backtest_history.db (run_id={run_id}, session_id={sess_id}, 잔고스냅샷={len(snap_rows)}건)")
     return run_id
 
 
