@@ -23,6 +23,7 @@ import pandas as pd
 import pyupbit
 
 from indicators import add_all_indicators, get_signal_score
+from backtest_db import save_signal_validation
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +229,7 @@ class SignalValidator:
             all_results[horizon_key] = horizon_results
 
         self._print_results(all_results, market, horizons)
+        save_signal_validation(all_results, market, days, self.config)
         return all_results
 
     # ──────────────────────────────────────────────────────────

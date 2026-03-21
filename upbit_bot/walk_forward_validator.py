@@ -30,6 +30,7 @@ import pyupbit
 
 from enhanced_backtester import EnhancedBacktester
 from indicators import add_all_indicators, get_sell_signal, get_signal_score
+from backtest_db import save_walkforward
 from enhanced_backtester import SLIPPAGE_RATE
 
 logger = logging.getLogger(__name__)
@@ -317,6 +318,7 @@ class WalkForwardValidator:
                 f"샤프 {r['sharpe_ratio']:.3f}"
                 f"{marker}"
             )
+        save_walkforward(results, results.get('market', market), results.get('total_days', total_days), n_windows, self.config)
         return results
 
     # ──────────────────────────────────────────────────────────

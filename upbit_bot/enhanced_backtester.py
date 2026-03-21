@@ -20,6 +20,7 @@ import pandas as pd
 import pyupbit
 
 from indicators import add_all_indicators, get_sell_signal, get_signal_score
+from backtest_db import save_backtest
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +406,7 @@ class EnhancedBacktester:
         }
 
         self._print_results(results)
+        save_backtest(results, self.config)
         return results
 
     # ──────────────────────────────────────────────────────────
