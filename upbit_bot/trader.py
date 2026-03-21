@@ -28,6 +28,7 @@ from market_scanner import MarketScanner
 from order_manager import OrderManager, fmt_price
 from market_indicators import MarketEnvironment
 from trade_logger import TradeLogger
+import backtest_db as _bdb
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,10 @@ class Trader:
 
         # 페이퍼 자금
         self.paper_capital = 1_000_000
+
+        # DB 세션 ID (봇 실행마다 고유, 거래 기록 연결용)
+        mode = 'paper' if config.PAPER_TRADING else 'live'
+        self._db_session_id = _bdb.start_trading_session(mode, config)
 
         # 동적 조정 카운터 (매 N사이클마다 익절/손절 재평가)
         self.adjust_counter = 0
@@ -431,6 +436,9 @@ class Trader:
                 result = get_signal_score(df.iloc[-1], self.config)
                 signal_score = result["score"]
                 signals = result["signals"]
+                _ind_row = df.iloc[-1].to_dict()
+            else:
+                _ind_row = {}
 
         self.entry_signal_score = signal_score
 
@@ -442,6 +450,17 @@ class Trader:
             fee=fee,
             signal_score=signal_score,
             signals=signals,
+        )
+        _bdb.record_buy(
+            session_id=self._db_session_id,
+            market=market,
+            price=self.entry_price,
+            amount_krw=self._pending_trade_amount,
+            coin_qty=self.coin_qty,
+            fee=fee,
+            signal_score=signal_score,
+            signals=signals,
+            indicators=_ind_row,
         )
 
         print(f"\n🟢 매수 체결! | {market} | 가격={fmt_price(self.entry_price)} | 수량={self.coin_qty:.8f}")
@@ -749,6 +768,22 @@ class Trader:
             reason=reason,
         )
 
+        buy_value = self.entry_price * self.coin_qty
+        sell_value = exit_price * self.coin_qty - fee
+        pnl_krw = sell_value - buy_value - (buy_value * self.config.FEE_RATE)
+        pnl_pct = pnl_krw / buy_value * 100 if buy_value else 0.0
+        _bdb.record_sell(
+            session_id=self._db_session_id,
+            market=market,
+            entry_price=self.entry_price,
+            exit_price=exit_price,
+            coin_qty=self.coin_qty,
+            fee=fee,
+            pnl_krw=pnl_krw,
+            pnl_pct=pnl_pct,
+            reason=reason,
+        )
+
         pnl_pct = (exit_price - self.entry_price) / self.entry_price * 100
         emoji = "🟢" if exit_price >= self.entry_price else "🔴"
         print(
@@ -1029,4 +1064,9 @@ class Trader:
                 print("  ℹ️ 기존 지정가 매도 주문은 유지됩니다.")
 
         self.trade_logger.print_summary()
+        _bdb.end_trading_session(
+            self._db_session_id,
+            self.trade_logger.performance,
+            self.paper_capital,
+        )
         self._clear_live_status()

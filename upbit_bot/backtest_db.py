@@ -1,11 +1,13 @@
 """
-backtest_db.py — 백테스트 결과 SQLite 영속 저장소
+backtest_db.py — 백테스트 + 실거래/모의거래 결과 SQLite 영속 저장소
 
 테이블:
   backtest_runs    — 강화 백테스터 실행 메타 + 요약 지표
   backtest_trades  — 백테스트 개별 거래 내역
   signal_runs      — 신호 검증 실행 기록 (JSON 직렬화)
   walkforward_runs — Walk-Forward 실행 기록 (JSON 직렬화)
+  trading_sessions — 봇 실행 세션 (config 스냅샷 + 최종 성과)
+  trading_records  — 실거래/모의거래 개별 거래 + 체결 시점 지표값
 """
 
 import json
@@ -79,6 +81,54 @@ def init_db():
             n_windows    INTEGER NOT NULL,
             results_json TEXT NOT NULL,
             config_json  TEXT
+        );
+
+        -- ── 실거래 / 모의거래 ──────────────────────────────────────
+        -- 봇 실행 세션: config 스냅샷 + 세션 종료 시 성과 요약
+        CREATE TABLE IF NOT EXISTS trading_sessions (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at       TEXT NOT NULL,
+            ended_at         TEXT,
+            mode             TEXT NOT NULL,      -- 'paper' | 'live'
+            config_json      TEXT NOT NULL,      -- 전체 파라미터 스냅샷
+            total_trades     INTEGER DEFAULT 0,
+            win_trades       INTEGER DEFAULT 0,
+            lose_trades      INTEGER DEFAULT 0,
+            win_rate_pct     REAL,
+            total_pnl_krw    REAL,
+            total_return_pct REAL,
+            initial_capital  REAL,
+            final_capital    REAL
+        );
+
+        -- 개별 거래: 세션 연결 + 체결 시점 지표값 (파라미터 튜닝 분석용)
+        CREATE TABLE IF NOT EXISTS trading_records (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id     INTEGER REFERENCES trading_sessions(id),
+            timestamp      TEXT NOT NULL,
+            action         TEXT NOT NULL,        -- 'BUY' | 'SELL'
+            market         TEXT NOT NULL,
+            price          REAL,
+            amount_krw     REAL,
+            coin_qty       REAL,
+            fee            REAL,
+            entry_price    REAL,
+            exit_price     REAL,
+            pnl_krw        REAL,
+            pnl_pct        REAL,
+            reason         TEXT,
+            signal_score   INTEGER,
+            signals_json   TEXT,                 -- {"rsi": true, "macd": false, ...}
+            -- 체결 시점 지표값 (승/패 원인 분석)
+            rsi            REAL,
+            bb_pct         REAL,
+            macd           REAL,
+            macd_hist      REAL,
+            volume_ratio   REAL,
+            atr_pct        REAL,
+            ema_short      REAL,
+            ema_long       REAL,
+            close_price    REAL
         );
         """)
 
@@ -275,3 +325,201 @@ def get_walkforward_run(run_id: int) -> dict | None:
         d["results"] = json.loads(d["results_json"])
         return d
     return None
+
+
+# ── 실거래 / 모의거래 세션 & 거래 기록 ─────────────────────────────
+
+def start_trading_session(mode: str, config) -> int:
+    init_db()
+    cfg_json = json.dumps({
+        "RSI_OVERSOLD":           config.RSI_OVERSOLD,
+        "MIN_SIGNAL_COUNT":       config.MIN_SIGNAL_COUNT,
+        "VOLUME_THRESHOLD":       config.VOLUME_THRESHOLD,
+        "STOP_LOSS_PCT":          config.STOP_LOSS_PCT,
+        "TAKE_PROFIT_PCT":        config.TAKE_PROFIT_PCT,
+        "TRAILING_STOP_PCT":      config.TRAILING_STOP_PCT,
+        "BREAKEVEN_TRIGGER_PCT":  config.BREAKEVEN_TRIGGER_PCT,
+        "TECHNICAL_EXIT_MIN_PCT": config.TECHNICAL_EXIT_MIN_PCT,
+        "MTF_CHECK":              config.MTF_CHECK,
+        "USE_TREND_FILTER":       config.USE_TREND_FILTER,
+        "TREND_FILTER_STRICT":    config.TREND_FILTER_STRICT,
+        "SCALED_ENTRY":           config.SCALED_ENTRY,
+        "CANDLE_UNIT":            config.CANDLE_UNIT,
+        "TRADE_AMOUNT_KRW":       config.TRADE_AMOUNT_KRW,
+    }, ensure_ascii=False)
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO trading_sessions (started_at, mode, config_json) VALUES (?,?,?)",
+            (datetime.now().isoformat(), mode, cfg_json),
+        )
+    return cur.lastrowid
+
+
+def end_trading_session(session_id: int, perf: dict, final_capital: float):
+    init_db()
+    total = perf.get("total_trades", 0)
+    wins  = perf.get("winning_trades", 0)
+    loses = perf.get("losing_trades", 0)
+    pnl   = perf.get("total_pnl_krw", 0.0)
+    init  = perf.get("paper_capital", final_capital)
+    ret   = (final_capital - init) / init * 100 if init else 0.0
+    wr    = wins / total * 100 if total else 0.0
+    with _connect() as conn:
+        conn.execute(
+            """UPDATE trading_sessions
+            SET ended_at=?, total_trades=?, win_trades=?, lose_trades=?,
+                win_rate_pct=?, total_pnl_krw=?, total_return_pct=?,
+                initial_capital=?, final_capital=?
+            WHERE id=?""",
+            (datetime.now().isoformat(), total, wins, loses,
+             wr, pnl, ret, init, final_capital, session_id),
+        )
+
+
+def record_buy(session_id: int, market: str, price: float,
+               amount_krw: float, coin_qty: float, fee: float,
+               signal_score: int, signals: dict, indicators: dict = None):
+    init_db()
+    ind = indicators or {}
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO trading_records
+                (session_id, timestamp, action, market, price,
+                 amount_krw, coin_qty, fee, entry_price,
+                 signal_score, signals_json,
+                 rsi, bb_pct, macd, macd_hist, volume_ratio, atr_pct,
+                 ema_short, ema_long, close_price)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                session_id, datetime.now().isoformat(), "BUY", market, price,
+                amount_krw, coin_qty, fee, price,
+                signal_score, json.dumps(signals, ensure_ascii=False),
+                ind.get("rsi"), ind.get("bb_pct"), ind.get("macd"), ind.get("macd_hist"),
+                ind.get("volume_ratio"), ind.get("atr_pct"),
+                ind.get("ema_short"), ind.get("ema_long"), ind.get("close"),
+            ),
+        )
+
+
+def record_sell(session_id: int, market: str, entry_price: float,
+                exit_price: float, coin_qty: float, fee: float,
+                pnl_krw: float, pnl_pct: float, reason: str):
+    init_db()
+    with _connect() as conn:
+        conn.execute(
+            """INSERT INTO trading_records
+                (session_id, timestamp, action, market, price,
+                 coin_qty, fee, entry_price, exit_price,
+                 pnl_krw, pnl_pct, reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                session_id, datetime.now().isoformat(), "SELL", market, exit_price,
+                coin_qty, fee, entry_price, exit_price, pnl_krw, pnl_pct, reason,
+            ),
+        )
+
+
+def import_csv_to_db(csv_path: str, session_id: int = None) -> int:
+    import csv as _csv
+    init_db()
+    if session_id is None:
+        with _connect() as conn:
+            cur = conn.execute(
+                "INSERT INTO trading_sessions (started_at, mode, config_json) VALUES (?,?,?)",
+                (datetime.now().isoformat(), "imported", json.dumps({"note": "CSV import"})),
+            )
+            session_id = cur.lastrowid
+
+    count = 0
+    with open(csv_path, encoding="utf-8") as f:
+        reader = _csv.DictReader(f)
+        rows_to_insert = []
+        for row in reader:
+            def _f(k, default=None, _row=row):
+                v = _row.get(k, "")
+                try:
+                    return float(v) if v not in ("", None) else default
+                except Exception:
+                    return default
+            rows_to_insert.append((
+                session_id, row.get("timestamp", ""), row.get("action", ""),
+                row.get("market", ""), _f("price"), _f("amount_krw"),
+                _f("coin_qty"), _f("fee"), _f("entry_price"), _f("exit_price"),
+                _f("pnl_krw"), _f("pnl_pct"), row.get("reason", ""), _f("signal_score"),
+            ))
+        with _connect() as conn:
+            conn.executemany(
+                """INSERT INTO trading_records
+                    (session_id, timestamp, action, market, price,
+                     amount_krw, coin_qty, fee, entry_price, exit_price,
+                     pnl_krw, pnl_pct, reason, signal_score)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                rows_to_insert,
+            )
+            count = len(rows_to_insert)
+    print(f"[DB] CSV 임포트 완료: {count}건 -> session_id={session_id}")
+    return count
+
+
+# ── 분석용 조회 ──────────────────────────────────────────────
+
+def list_trading_sessions(limit: int = 30) -> list[dict]:
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, started_at, ended_at, mode,
+                   total_trades, win_rate_pct, total_pnl_krw, total_return_pct,
+                   initial_capital, final_capital
+            FROM trading_sessions ORDER BY id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_trading_records(session_id: int = None, limit: int = 500) -> list[dict]:
+    init_db()
+    with _connect() as conn:
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM trading_records WHERE session_id=? ORDER BY timestamp DESC LIMIT ?",
+                (session_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM trading_records ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_param_performance_summary() -> list[dict]:
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT id, started_at, mode, config_json,
+                   total_trades, win_rate_pct, total_pnl_krw, total_return_pct,
+                   initial_capital, final_capital
+            FROM trading_sessions WHERE total_trades > 0 ORDER BY id DESC""",
+        ).fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["config"] = json.loads(d["config_json"])
+        except Exception:
+            d["config"] = {}
+        result.append(d)
+    return result
+
+
+def get_indicator_win_analysis() -> list[dict]:
+    init_db()
+    with _connect() as conn:
+        rows = conn.execute(
+            """SELECT r.*, s.config_json
+            FROM trading_records r
+            LEFT JOIN trading_sessions s ON r.session_id = s.id
+            WHERE r.action = 'SELL'
+            ORDER BY r.timestamp DESC""",
+        ).fetchall()
+    return [dict(r) for r in rows]
