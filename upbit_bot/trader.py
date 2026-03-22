@@ -79,12 +79,17 @@ class Trader:
         self.adjust_every = 5
 
         # 분할 투자 (DCA) 추적 변수
-        self._dca_trigger_price = 0.0   # 2차 매수 트리거 가격 (1차 매수가 × (1 - DIP))
-        self._dca_amount = 0.0          # 2차 매수 금액
-        self._dca_done = False          # 2차 매수 완료 여부
-        self._dca_order_pending = False # 2차 매수 주문 체결 대기 중
-        self._dca_timeout_at = None     # 2차 매수 대기 만료 시각
-        self._avg_entry_price = 0.0     # 분할 매수 후 평균 단가
+        # ── 물타기 다단계 DCA ──
+        self._dca_levels_pending = []   # [(trigger_price, amount), ...] 아직 안 터진 단계
+        self._dca_order_pending = False # DCA 주문 체결 대기 중
+        self._dca_current_amount = 0.0  # 현재 체결 대기 중인 DCA 금액
+        self._dca_timeout_at = None     # 전체 DCA 대기 만료 시각
+        self._dca_done = False          # 모든 DCA 완료 여부
+        self._avg_entry_price = 0.0     # 평균 단가
+        # ── 불타기 피라미딩 ──
+        self._pyramid_done = False      # 불타기 완료 여부
+        self._pyramid_order_pending = False  # 불타기 주문 체결 대기 중
+        self._pyramid_amount = 0.0      # 불타기 투자금액
 
         # 본전 보호 활성화 추적
         self._breakeven_activated = False
@@ -333,8 +338,8 @@ class Trader:
         print(f"    손절 기준   : {fmt_price(entry_info['sl_price']):>12}원 ({entry_info['sl_pct']:+.2f}%)")
         print(f"    지지선      : {', '.join(fmt_price(s) for s in entry_info['support_levels'])}")
 
-        # 지정가 매수 주문 설정
-        trade_amount = self.config.TRADE_AMOUNT_KRW
+        # 지정가 매수 주문 설정 — 잔고 비례 or 고정금액
+        trade_amount = self._calc_trade_amount()
         if self.config.PAPER_TRADING:
             trade_amount = min(trade_amount, self.paper_capital * 0.95)
         if trade_amount < 5000:
@@ -486,23 +491,31 @@ class Trader:
 
         print(f"  📤 익절 주문: {fmt_price(tp_price)} | 손절 주문: {fmt_price(sl_price)}")
 
-        # ── 분할 투자 (DCA) 설정 ──
+        # ── 물타기 다단계 DCA 초기화 ──
         self._avg_entry_price = self.entry_price
         self._breakeven_activated = False
+        self._dca_levels_pending = []
+        self._dca_done = False
+        self._pyramid_done = False
+        self._pyramid_order_pending = False
+        from datetime import timedelta
         scaled = getattr(self.config, "SCALED_ENTRY", False)
-        if scaled and not self._dca_done:
-            dip = getattr(self.config, "SCALED_ENTRY_DIP_PCT", 0.015)
-            ratio_1st = getattr(self.config, "SCALED_ENTRY_1ST_RATIO", 0.6)
-            timeout_min = getattr(self.config, "SCALED_ENTRY_TIMEOUT_MIN", 30)
-            self._dca_trigger_price = self.entry_price * (1 - dip)
-            self._dca_amount = self._pending_trade_amount * (1 - ratio_1st) / ratio_1st
-            from datetime import timedelta
+        if scaled:
+            dca_levels = getattr(self.config, "DCA_LEVELS", [(0.015, 0.25), (0.030, 0.25)])
+            timeout_min = getattr(self.config, "SCALED_ENTRY_TIMEOUT_MIN", 60)
             self._dca_timeout_at = datetime.now() + timedelta(minutes=timeout_min)
-            print(
-                f"  🔀 DCA 설정: 2차 매수 트리거 {fmt_price(self._dca_trigger_price)} "
-                f"({dip*100:.1f}% 하락 시) | 금액={self._dca_amount:,.0f}원 | "
-                f"만료={timeout_min}분"
-            )
+            for dip_pct, add_ratio in dca_levels:
+                trigger_p = self.entry_price * (1 - dip_pct)
+                add_amount = self._pending_trade_amount * add_ratio
+                self._dca_levels_pending.append((trigger_p, add_amount))
+            msgs = [f"{d*100:.1f}%↓={fmt_price(p)}" for (p, _) in self._dca_levels_pending]
+            print(f"  💧 물타기 설정 ({len(self._dca_levels_pending)}단계): {' / '.join(msgs)} | 만료={timeout_min}분")
+        # ── 불타기 피라미딩 초기화 ──
+        if getattr(self.config, "PYRAMID_ENABLED", False):
+            ratio = getattr(self.config, "PYRAMID_ADD_RATIO", 0.5)
+            self._pyramid_amount = self._pending_trade_amount * ratio
+            trig = getattr(self.config, "PYRAMID_TRIGGER_PCT", 0.015) * 100
+            print(f"  🔥 불타기 설정: +{trig:.1f}% 도달 시 {self._pyramid_amount:,.0f}원 추가 매수")
 
         # 상태 전이
         self.state = STATE_POSITION
@@ -542,39 +555,93 @@ class Trader:
             self._on_sell_filled(sell_result)
             return
 
-        # ── DCA 2차 매수 관리 ──
+        # ── 물타기 다단계 DCA ──
         if self._dca_order_pending and self.order_mgr.active_buy_order is not None:
-            # 2차 매수 체결 확인
             if self.order_mgr.check_buy_order_filled(market):
                 self._on_dca_filled()
         elif (
-            not self._dca_done
-            and not self._dca_order_pending
-            and self._dca_trigger_price > 0
+            not self._dca_order_pending
+            and self._dca_levels_pending
             and self.order_mgr.active_buy_order is None
         ):
             if self._dca_timeout_at and datetime.now() > self._dca_timeout_at:
-                # 타임아웃: 2차 매수 없이 1차만으로 포지션 확정
-                logger.info("DCA 2차 매수 타임아웃 → 1차 포지션으로 확정")
+                logger.info("물타기 타임아웃 → 현 포지션 확정")
+                self._dca_levels_pending.clear()
                 self._dca_done = True
-                self._dca_trigger_price = 0.0
-            elif current_price <= self._dca_trigger_price:
-                # 트리거 가격 도달 → 2차 매수 주문 실행
-                order = self.order_mgr.place_limit_buy(
-                    market, current_price, self._dca_amount
-                )
+            else:
+                next_trigger, next_amount = self._dca_levels_pending[0]
+                if current_price <= next_trigger:
+                    order = self.order_mgr.place_limit_buy(market, current_price, next_amount)
+                    if order:
+                        self._dca_current_amount = next_amount
+                        self._dca_order_pending = True
+                        level_no = getattr(self.config, "DCA_LEVELS", [(0,0),(0,0)])
+                        step = len(level_no) - len(self._dca_levels_pending) + 2
+                        print(f"  💧 물타기 {step}차 주문! 가격={fmt_price(current_price)} | 금액={next_amount:,.0f}원")
+
+        # ── 불타기 피라미딩 ──
+        if (
+            getattr(self.config, "PYRAMID_ENABLED", False)
+            and not self._pyramid_done
+            and not self._pyramid_order_pending
+            and self.order_mgr.active_buy_order is None
+            and self.entry_price > 0
+        ):
+            trig = getattr(self.config, "PYRAMID_TRIGGER_PCT", 0.015)
+            pnl_now = (current_price - self.entry_price) / self.entry_price
+            if pnl_now >= trig:
+                order = self.order_mgr.place_limit_buy(market, current_price, self._pyramid_amount)
                 if order:
-                    self._dca_order_pending = True
-                    print(
-                        f"  🔀 DCA 2차 매수 주문! "
-                        f"가격={fmt_price(current_price)} | 금액={self._dca_amount:,.0f}원"
-                    )
+                    self._pyramid_order_pending = True
+                    print(f"  🔥 불타기! +{pnl_now*100:.2f}% 수익 | 가격={fmt_price(current_price)} | 금액={self._pyramid_amount:,.0f}원")
+        if self._pyramid_order_pending and self.order_mgr.active_buy_order is not None:
+            if self.order_mgr.check_buy_order_filled(market):
+                self._on_pyramid_filled()
 
         # ── 차트 분석 → 동적 익절/손절 조정 ──
         self.adjust_counter += 1
         if self.adjust_counter % self.adjust_every == 0:
             self._dynamic_adjust_exit(market, current_price)
 
+
+    def _on_pyramid_filled(self):
+        """불타기 체결 처리 — 평균단가 재계산 + SL 상향 조정"""
+        order = self.order_mgr.active_buy_order
+        if order is None:
+            return
+        p_price = order["price"]
+        p_qty   = order["volume"]
+        p_fee   = order["fee"]
+
+        total_cost = self.entry_price * self.coin_qty + p_price * p_qty
+        self.coin_qty += p_qty
+        self._avg_entry_price = total_cost / self.coin_qty
+        self.entry_price = self._avg_entry_price
+
+        if self.config.PAPER_TRADING:
+            self.paper_capital -= (self._pyramid_amount + p_fee)
+
+        new_tp = self.order_mgr._round_to_tick(
+            self.entry_price * (1 + self.config.TAKE_PROFIT_PCT), self.entry_price)
+        # 불타기 후 SL → 평균단가+수수료 (손실 없이 탈출 보장)
+        if getattr(self.config, "PYRAMID_SL_TO_ENTRY", True):
+            new_sl = self.order_mgr._round_to_tick(
+                self.entry_price * (1 + self.config.FEE_RATE * 2), self.entry_price)
+        else:
+            new_sl = self.order_mgr._round_to_tick(
+                self.entry_price * (1 - self.config.STOP_LOSS_PCT), self.entry_price)
+        self.order_mgr.cancel_sell_orders()
+        self.order_mgr.place_limit_sell(self.current_market, new_tp, self.coin_qty, "tp")
+        self.order_mgr.place_limit_sell(self.current_market, new_sl, self.coin_qty, "sl")
+        self.order_mgr.active_buy_order = None
+        self._pyramid_done = True
+        self._pyramid_order_pending = False
+        self._breakeven_activated = False
+        self._save_state()
+        print(
+            f"  🔥 불타기 체결! | 평균단가={fmt_price(self.entry_price)} | "
+            f"총수량={self.coin_qty:.8f} | TP={fmt_price(new_tp)} SL={fmt_price(new_sl)} (본전+수수료)"
+        )
     def _dynamic_adjust_exit(self, market: str, current_price: float):
         """차트를 재분석하여 익절/손절 가격을 동적으로 조정합니다."""
         df = pyupbit.get_ohlcv(
@@ -721,31 +788,31 @@ class Trader:
         self.entry_price = self._avg_entry_price  # PnL 계산 기준도 평균단가로
 
         if self.config.PAPER_TRADING:
-            self.paper_capital -= (self._dca_amount + dca_fee)
+            self.paper_capital -= (self._dca_current_amount + dca_fee)
+
+        # 다음 DCA 레벨로 이동
+        if self._dca_levels_pending:
+            self._dca_levels_pending.pop(0)
+        if not self._dca_levels_pending:
+            self._dca_done = True
 
         # TP/SL을 평균단가 기준으로 재설정
         new_tp = self.order_mgr._round_to_tick(
-            self.entry_price * (1 + self.config.TAKE_PROFIT_PCT),
-            self.entry_price,
-        )
+            self.entry_price * (1 + self.config.TAKE_PROFIT_PCT), self.entry_price)
         new_sl = self.order_mgr._round_to_tick(
-            self.entry_price * (1 - self.config.STOP_LOSS_PCT),
-            self.entry_price,
-        )
+            self.entry_price * (1 - self.config.STOP_LOSS_PCT), self.entry_price)
         self.order_mgr.cancel_sell_orders()
         self.order_mgr.place_limit_sell(self.current_market, new_tp, self.coin_qty, "tp")
         self.order_mgr.place_limit_sell(self.current_market, new_sl, self.coin_qty, "sl")
-        self.order_mgr.active_buy_order = None  # DCA 완료 — 매수 주문 클리어
-
-        self._dca_done = True
+        self.order_mgr.active_buy_order = None
         self._dca_order_pending = False
-        self._breakeven_activated = False  # 새 평균단가 기준으로 초기화
+        self._breakeven_activated = False
+        remaining = len(self._dca_levels_pending)
         self._save_state()
-
         print(
-            f"  ✅ DCA 2차 체결! | 평균단가={fmt_price(self.entry_price)} | "
-            f"총수량={self.coin_qty:.8f} | "
-            f"새 TP={fmt_price(new_tp)} SL={fmt_price(new_sl)}"
+            f"  ✅ 물타기 체결! | 평균단가={fmt_price(self.entry_price)} | "
+            f"총수량={self.coin_qty:.8f} | TP={fmt_price(new_tp)} SL={fmt_price(new_sl)} | "
+            f"남은단계={remaining}"
         )
 
     def _on_sell_filled(self, sell_result: dict):
@@ -829,14 +896,17 @@ class Trader:
         self.highest_price = 0.0
         self.order_mgr.clear_all()
 
-        # DCA 변수 초기화
-        self._dca_trigger_price = 0.0
-        self._dca_amount = 0.0
+        # DCA / 피라미딩 변수 초기화
+        self._dca_levels_pending = []
+        self._dca_current_amount = 0.0
         self._dca_done = False
         self._dca_order_pending = False
         self._dca_timeout_at = None
         self._avg_entry_price = 0.0
         self._breakeven_activated = False
+        self._pyramid_done = False
+        self._pyramid_order_pending = False
+        self._pyramid_amount = 0.0
 
         # 포지션 정리 완료 — 상태 파일 삭제
         self._clear_state()
@@ -874,6 +944,26 @@ class Trader:
             logger.debug(f"봇 상태 저장 완료: {self.state} | {self.current_market}")
         except Exception as e:
             logger.warning(f"상태 파일 저장 실패: {e}")
+
+    def _calc_trade_amount(self) -> float:
+        """잔고 비례 투자금 계산.
+        TRADE_AMOUNT_PCT > 0 이면 현재 자금의 N%, 아니면 고정 TRADE_AMOUNT_KRW 사용.
+        """
+        pct = getattr(self.config, "TRADE_AMOUNT_PCT", 0)
+        if pct > 0:
+            if self.config.PAPER_TRADING:
+                capital = self.paper_capital
+            else:
+                try:
+                    bal = self.client.upbit.get_balances()
+                    capital = next((float(b["balance"]) for b in (bal or []) if b["currency"] == "KRW"), self.paper_capital)
+                except Exception:
+                    capital = self.paper_capital
+            amount = capital * pct
+            min_a = getattr(self.config, "TRADE_AMOUNT_MIN", 10_000)
+            max_a = getattr(self.config, "TRADE_AMOUNT_MAX", 500_000)
+            return max(min_a, min(amount, max_a))
+        return float(self.config.TRADE_AMOUNT_KRW)
 
     def _clear_state(self):
         """상태 파일을 삭제합니다."""
