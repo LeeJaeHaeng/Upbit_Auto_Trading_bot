@@ -39,41 +39,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── 모바일 감지 & CSS ──
-# 북마크: http://<PC_IP>:8501?m=1  → 모바일 최적화 레이아웃 활성화
-is_mobile = st.query_params.get("m", "0") == "1"
-
-# 반응형 CSS: 태블릿/폰에서 컬럼 자동 2열 → 1열 wrapping
-st.markdown("""<style>
-@media (max-width: 768px) {
-    [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
-    [data-testid="stHorizontalBlock"] > div[data-testid="column"] {
-        flex: 1 1 calc(50% - 1rem) !important;
-        min-width: calc(50% - 1rem) !important;
-    }
-    .block-container { padding: 0.5rem 0.5rem 2rem !important; }
-}
-@media (max-width: 480px) {
-    [data-testid="stHorizontalBlock"] > div[data-testid="column"] {
-        flex: 1 1 100% !important;
-        min-width: 100% !important;
-    }
-}
-</style>""", unsafe_allow_html=True)
-
-# ?m=1 모바일 모드: 사이드바 숨김 + 터치 친화적 UI
-if is_mobile:
-    st.markdown("""<style>
-section[data-testid="stSidebar"],
-[data-testid="collapsedControl"] { display: none !important; }
-.block-container { padding: 0.25rem 0.5rem 3rem !important; max-width: 100% !important; }
-[data-testid="stMetricValue"] { font-size: 1.3rem !important; font-weight: 700 !important; }
-[data-testid="stMetricLabel"] { font-size: 0.82rem !important; }
-h1 { font-size: 1.4rem !important; }
-h2, h3 { font-size: 1.15rem !important; }
-button { min-height: 2.75rem !important; font-size: 0.95rem !important; }
-</style>""", unsafe_allow_html=True)
-
 import config as cfg
 
 LOG_FILE = cfg.LOG_FILE
@@ -377,27 +342,16 @@ else:
 st.sidebar.markdown("---")
 
 # ── 페이지 선택 ──
-_PAGE_OPTIONS = [
-    "🔴 실시간 현황",
-    "실시간 차트 & 지표",
-    "거래 내역 & 성과",
-    "💰 내 업비트 지갑",
-    "📰 비트코인 뉴스",
-]
-
-if "current_page" not in st.session_state:
-    st.session_state.current_page = _PAGE_OPTIONS[0]
-
-_sidebar_page = st.sidebar.radio(
+page = st.sidebar.radio(
     "페이지",
-    _PAGE_OPTIONS,
-    index=_PAGE_OPTIONS.index(st.session_state.current_page),
-    key="_sidebar_page_nav",
+    [
+        "🔴 실시간 현황",
+        "실시간 차트 & 지표",
+        "거래 내역 & 성과",
+        "💰 내 업비트 지갑",
+        "📰 비트코인 뉴스",
+    ],
 )
-if _sidebar_page != st.session_state.current_page:
-    st.session_state.current_page = _sidebar_page
-
-page = st.session_state.current_page
 
 @st.cache_data(ttl=300)
 def _get_volume_filtered_markets(top_n: int = 50) -> list:
@@ -613,40 +567,6 @@ def _check_trade_notifications():
         pass
 
 _check_trade_notifications()
-
-
-# ── 모바일 상단 내비게이션 (사이드바 숨김 시 대체 내비) ──
-if is_mobile:
-    # 봇 상태 배너 + 시작/종료 버튼 (사이드바 대체)
-    _mbot = get_bot_status()
-    if _mbot["running"]:
-        _mmode = "🔴 실거래" if _mbot.get("mode") == "live" else "🟡 페이퍼"
-        _mc1, _mc2 = st.columns([3, 1])
-        _mc1.success(f"**봇 실행 중** {_mmode}  PID {_mbot['pid']}")
-        if _mc2.button("⏹ 종료", use_container_width=True, type="primary", key="_m_stop"):
-            stop_bot(_mbot["pid"])
-            st.rerun()
-    else:
-        _mc1, _mc2 = st.columns([3, 1])
-        _mc1.error("**봇 정지 중**")
-        if _mc2.button("▶ 시작", use_container_width=True, type="primary", key="_m_start"):
-            start_bot(live=False)
-            st.rerun()
-
-    # 페이지 내비게이션 탭
-    _NAV_LABELS = ["🔴 현황", "📈 차트", "📊 거래", "💰 지갑", "📰 뉴스"]
-    _nav_cols = st.columns(5)
-    for _i, (_nc, _label, _pg) in enumerate(zip(_nav_cols, _NAV_LABELS, _PAGE_OPTIONS)):
-        if _nc.button(
-            _label,
-            use_container_width=True,
-            type="primary" if st.session_state.current_page == _pg else "secondary",
-            key=f"_mnav_{_i}",
-        ):
-            st.session_state.current_page = _pg
-            st.rerun()
-    page = st.session_state.current_page
-    st.markdown("---")
 
 
 # ══════════════════════════════════════════════════════════════
