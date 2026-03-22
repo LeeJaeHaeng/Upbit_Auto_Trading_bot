@@ -625,7 +625,16 @@ if page == "🔴 실시간 현황":
     st.markdown("---")
 
     # ── KPI 행 ──
-    paper_capital = live.get("paper_capital", 0)
+    # DB balance_snapshots가 항상 정확한 누적 잔고의 원본.
+    # live_status.json은 구 봇 코드에서 1,000,000원으로 초기화될 수 있으므로
+    # 실행/정지 구분 없이 DB를 우선하고 DB 기록이 없을 때만 live_status 사용.
+    live_paper_capital = live.get("paper_capital", 0)
+    try:
+        import backtest_db as _bdb_dash
+        db_capital = _bdb_dash.get_last_paper_capital(fallback=None)
+        paper_capital = db_capital if db_capital is not None else live_paper_capital
+    except Exception:
+        paper_capital = live_paper_capital
     kpi_cols = st.columns(4)
 
     kpi_cols[0].metric(

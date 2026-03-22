@@ -7,7 +7,7 @@ import numpy as np
 
 
 def calculate_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
-    """RSI (Relative Strength Index) 계산"""
+    """RSI (Relative Strength Index) 계산 — Wilder 스무딩 방식"""
     delta = closes.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -74,6 +74,35 @@ def calculate_volume_ma(volumes: pd.Series, period: int = 20) -> pd.Series:
     return volumes.rolling(period).mean()
 
 
+def calculate_obv(closes: pd.Series, volumes: pd.Series) -> pd.Series:
+    """
+    OBV (On-Balance Volume) 계산 — 스마트머니 매집/분산 감지
+    상승 시 거래량 누적, 하락 시 차감
+    """
+    direction = np.sign(closes.diff().fillna(0))
+    return (direction * volumes).cumsum()
+
+
+def calculate_stoch_rsi(rsi: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Stochastic RSI 계산 (0~100 범위)
+    RSI의 RSI — 일반 RSI보다 빠르게 과매도/과매수 감지
+    """
+    rsi_min = rsi.rolling(period).min()
+    rsi_max = rsi.rolling(period).max()
+    denom = rsi_max - rsi_min
+    stoch = (rsi - rsi_min) / denom.replace(0, np.nan)
+    return (stoch * 100).fillna(50)
+
+
+def calculate_bb_width(upper: pd.Series, lower: pd.Series, middle: pd.Series) -> pd.Series:
+    """
+    볼린저 밴드 폭 = (upper - lower) / middle
+    값이 낮을수록 스퀴즈(수축) 상태 → 폭발적 움직임 예고
+    """
+    return (upper - lower) / middle.replace(0, np.nan)
+
+
 def add_all_indicators(df: pd.DataFrame, config) -> pd.DataFrame:
     """DataFrame에 모든 지표를 추가하여 반환"""
     closes = df["close"]
@@ -110,32 +139,73 @@ def add_all_indicators(df: pd.DataFrame, config) -> pd.DataFrame:
     df["volume_ma"] = calculate_volume_ma(volumes, config.VOLUME_MA_PERIOD)
     df["volume_ratio"] = volumes / df["volume_ma"]
 
+    # ── 추가 지표 ──
+    # OBV: 스마트머니 방향성 감지
+    df["obv"] = calculate_obv(closes, volumes)
+    df["obv_ma"] = df["obv"].rolling(10).mean()
+
+    # Stochastic RSI: 빠른 과매도/과매수 감지
+    df["stoch_rsi"] = calculate_stoch_rsi(df["rsi"], period=14)
+
+    # BB Width: 스퀴즈(밴드 수축) 감지 → 돌파 예고 신호
+    df["bb_width"] = calculate_bb_width(df["bb_upper"], df["bb_lower"], df["bb_middle"])
+    df["bb_width_ma"] = df["bb_width"].rolling(20).mean()
+
+    # RSI 기울기 (이전 대비 방향)
+    df["rsi_prev"] = df["rsi"].shift(2)
+
     return df
 
 
 def get_signal_score(row: pd.Series, config) -> dict:
     """
     현재 캔들의 매수 신호 점수를 계산합니다.
-    각 지표별 신호를 반환하며, True = 매수 신호.
+    세계 최고 트레이더 전략 종합 반영:
+    - RSI 기울기 반전 확인 (Stan Weinstein: 과매도 후 반등 확인)
+    - MACD 제로선 하방 골든크로스 (Larry Williams: 최강 반전 신호)
+    - BB 스퀴즈 + 하단 반등 (볼린저밴드 발명자 John Bollinger)
+    - EMA 골든크로스 + 기울기 (Mark Minervini: 모든 EMA 우상향)
+    - OBV + 거래량 급등 (스마트머니 축적 확인)
 
     반환값: {
         'signals': {지표명: True/False},
         'score': 총 True 개수,
-        'details': 상세 설명
+        'details': 상세 설명,
+        'strength': 신호 강도 (0.0~5.0, 소수점)
     }
     """
     signals = {}
     details = {}
+    strength_scores = {}  # 각 신호의 강도 (0.0~1.0)
 
     # ── 1. RSI 신호 ──
-    # RSI가 과매도 기준 이하이면 매수 신호
+    # 기본: RSI < 과매도 기준
+    # 강화: RSI가 2캔들 전보다 상승 중이면 반전 확인 (더 강한 신호)
     rsi = row["rsi"]
-    signals["rsi"] = rsi < config.RSI_OVERSOLD
-    details["rsi"] = f"RSI={rsi:.1f} (기준≤{config.RSI_OVERSOLD})"
+    rsi_prev2 = row.get("rsi_prev", np.nan)
+    rsi_oversold = rsi < config.RSI_OVERSOLD
+    rsi_rising = pd.notna(rsi_prev2) and rsi > rsi_prev2  # RSI 반등 중
+    stoch_rsi = row.get("stoch_rsi", 50.0)
+
+    # RSI 과매도 + 상승 반전 = 강한 신호 / 과매도만 = 일반 신호
+    if rsi_oversold and rsi_rising:
+        signals["rsi"] = True
+        strength_scores["rsi"] = 1.0  # 강한 반전 신호
+    elif rsi_oversold:
+        signals["rsi"] = True
+        strength_scores["rsi"] = 0.7
+    elif stoch_rsi < 20 and rsi_rising:  # Stoch RSI 극과매도 + 상승
+        signals["rsi"] = True
+        strength_scores["rsi"] = 0.6
+    else:
+        signals["rsi"] = False
+        strength_scores["rsi"] = 0.0
+    details["rsi"] = f"RSI={rsi:.1f}(기준≤{config.RSI_OVERSOLD}) StochRSI={stoch_rsi:.0f} {'↑반전' if rsi_rising else ''}"
 
     # ── 2. MACD 신호 ──
-    # MACD 히스토그램이 음수에서 양수로 전환되거나,
-    # 히스토그램/라인이 모두 상승 중이면 초기 반전 신호로 판단
+    # 최강: 제로선 하방에서 히스토그램 반전 (MACD < 0 이면서 hist 전환)
+    # 강: 히스토그램 음→양 전환 (골든크로스)
+    # 보통: 히스토그램 + MACD 동시 상승 중
     macd_hist = row["macd_hist"]
     macd = row["macd"]
     macd_prev = row.get("macd_prev", np.nan)
@@ -153,37 +223,103 @@ def get_signal_score(row: pd.Series, config) -> dict:
         and macd_hist > macd_hist_prev
         and macd_hist > 0
     )
+    # 제로선 하방 골든크로스 = 가장 신뢰도 높은 신호
+    zero_line_cross = hist_cross_up and macd < 0
 
-    signals["macd"] = (macd_hist > 0 and macd < 0) or hist_cross_up or momentum_turn_up
-    details["macd"] = f"MACD={macd:.2f}, Hist={macd_hist:.2f}"
+    if zero_line_cross:
+        signals["macd"] = True
+        strength_scores["macd"] = 1.0  # 최강 신호
+    elif hist_cross_up:
+        signals["macd"] = True
+        strength_scores["macd"] = 0.8
+    elif (macd_hist > 0 and macd < 0) or momentum_turn_up:
+        signals["macd"] = True
+        strength_scores["macd"] = 0.5
+    else:
+        signals["macd"] = False
+        strength_scores["macd"] = 0.0
+    details["macd"] = f"MACD={macd:.4f}, Hist={macd_hist:.4f} {'제로선하방크로스!' if zero_line_cross else ('골든크로스' if hist_cross_up else '')}"
 
     # ── 3. 볼린저 밴드 신호 ──
-    # 가격이 하단 밴드 근처 (bb_pct < 0.2 = 하단 20%)
+    # 스퀴즈(밴드 수축) 후 하단에서 반등 = 폭발적 상승 전조
+    # 기본: bb_pct < 0.25 (하단 25% 구간)
     bb_pct = row["bb_pct"]
-    signals["bollinger"] = bb_pct < 0.25
-    details["bollinger"] = f"BB%={bb_pct:.2f} (기준<0.25)"
+    bb_width = row.get("bb_width", np.nan)
+    bb_width_ma = row.get("bb_width_ma", np.nan)
+    close = row["close"]
+    open_price = row.get("open", close)
+
+    # BB 스퀴즈 감지 (밴드 폭이 평균보다 좁으면 돌파 임박)
+    bb_squeeze = pd.notna(bb_width) and pd.notna(bb_width_ma) and bb_width < bb_width_ma * 0.9
+    # 양봉 확인 (하단에서 실제로 반등 중)
+    bullish_candle = close > open_price
+
+    if bb_pct < 0.15 and bullish_candle:  # 하단 15% + 양봉
+        signals["bollinger"] = True
+        strength_scores["bollinger"] = 1.0
+    elif bb_pct < 0.25 and bb_squeeze:  # 하단 25% + 스퀴즈
+        signals["bollinger"] = True
+        strength_scores["bollinger"] = 0.8
+    elif bb_pct < 0.25:  # 하단 25%
+        signals["bollinger"] = True
+        strength_scores["bollinger"] = 0.6
+    else:
+        signals["bollinger"] = False
+        strength_scores["bollinger"] = 0.0
+    details["bollinger"] = f"BB%={bb_pct:.2f} {'스퀴즈!' if bb_squeeze else ''} {'양봉' if bullish_candle else '음봉'}"
 
     # ── 4. EMA 추세 신호 ──
-    # 단기 EMA > 장기 EMA (단기 상승 추세)
+    # Minervini SEPA: 단기>장기 EMA + EMA200 위에 있거나 5% 이내 + EMA 자체가 우상향
     ema_short = row["ema_short"]
     ema_long = row["ema_long"]
     ema_trend = row["ema_trend"]
-    close = row["close"]
-    # 가격이 EMA200 위에 있거나 EMA200 5% 이내 (과도한 하락 제외)
     near_trend = close >= ema_trend * 0.95
-    signals["ema"] = (ema_short > ema_long) and near_trend
-    # 가격 크기에 따라 소수점 자릿수 조정
-    _ema_fmt = ".0f" if ema_short >= 100 else (".1f" if ema_short >= 10 else ".3f")
-    details["ema"] = f"EMA단기={ema_short:{_ema_fmt}}, EMA장기={ema_long:{_ema_fmt}}, 추세필터={'OK' if near_trend else 'X'}"
 
-    # ── 5. 거래량 신호 ──
-    # 현재 거래량이 평균보다 높을수록 신호 신뢰도 높음
+    # EMA 정배열: 단기 > 장기 EMA
+    ema_aligned = ema_short > ema_long
+    # 이상적 조건: close > ema_short > ema_long (가격이 모든 EMA 위)
+    full_alignment = close > ema_short > ema_long
+
+    if full_alignment and near_trend:
+        signals["ema"] = True
+        strength_scores["ema"] = 1.0  # 완전 정배열
+    elif ema_aligned and near_trend:
+        signals["ema"] = True
+        strength_scores["ema"] = 0.7
+    else:
+        signals["ema"] = False
+        strength_scores["ema"] = 0.0
+    _ema_fmt = ".0f" if ema_short >= 100 else (".2f" if ema_short >= 1 else ".4f")
+    details["ema"] = (
+        f"EMA단기={ema_short:{_ema_fmt}}, EMA장기={ema_long:{_ema_fmt}}, "
+        f"추세={'완전정배열' if full_alignment else ('정배열' if ema_aligned else 'X')}"
+    )
+
+    # ── 5. 거래량 + OBV 신호 ──
+    # 기본: 거래량 평균 대비 급증
+    # 강화: OBV가 이동평균 위에 있으면 스마트머니 매집 확인
     volume_ratio = row["volume_ratio"]
-    signals["volume"] = volume_ratio >= config.VOLUME_THRESHOLD
-    details["volume"] = f"거래량배율={volume_ratio:.2f} (기준≥{config.VOLUME_THRESHOLD})"
+    obv = row.get("obv", np.nan)
+    obv_ma = row.get("obv_ma", np.nan)
+    obv_rising = pd.notna(obv) and pd.notna(obv_ma) and obv > obv_ma  # OBV > OBV MA = 매집
+
+    if volume_ratio >= config.VOLUME_THRESHOLD and obv_rising:
+        signals["volume"] = True
+        strength_scores["volume"] = 1.0  # 거래량 + OBV 동시 확인
+    elif volume_ratio >= config.VOLUME_THRESHOLD:
+        signals["volume"] = True
+        strength_scores["volume"] = 0.7
+    elif obv_rising and volume_ratio >= config.VOLUME_THRESHOLD * 0.8:  # OBV는 좋지만 거래량 약간 부족
+        signals["volume"] = True
+        strength_scores["volume"] = 0.5
+    else:
+        signals["volume"] = False
+        strength_scores["volume"] = 0.0
+    details["volume"] = f"거래량배율={volume_ratio:.2f}(기준≥{config.VOLUME_THRESHOLD}) OBV={'매집' if obv_rising else '분산'}"
 
     score = sum(signals.values())
-    return {"signals": signals, "score": score, "details": details}
+    strength = sum(strength_scores[k] for k in signals if signals[k])
+    return {"signals": signals, "score": score, "details": details, "strength": round(strength, 2)}
 
 
 def get_sell_signal(
@@ -236,21 +372,35 @@ def get_sell_signal(
     if pnl_pct > 0.01 and drawdown <= -config.TRAILING_STOP_PCT:
         return {"should_sell": True, "reason": f"트레일링 스탑 (고점 대비 {drawdown*100:.2f}%)"}
 
-    # 5. 기술적 매도 신호
+    # 5. 기술적 매도 신호 (다중 확인)
     sell_signals = 0
+    sell_reasons = []
+
     if rsi > config.RSI_OVERBOUGHT:
         sell_signals += 1
+        sell_reasons.append(f"RSI과매수({rsi:.0f})")
+
     if bb_pct > 0.9:  # 볼린저 상단 근처
         sell_signals += 1
+        sell_reasons.append("BB상단")
+
     macd_hist = row["macd_hist"]
     if macd_hist < 0 and row["macd"] > 0:  # MACD 골든크로스 이후 데드크로스 신호
         sell_signals += 1
+        sell_reasons.append("MACD데드크로스")
+
+    # 거래량 급증 + 음봉 = 분배 신호
+    volume_ratio = row.get("volume_ratio", 1.0)
+    open_price = row.get("open", close)
+    if volume_ratio > 2.5 and close < open_price:
+        sell_signals += 1
+        sell_reasons.append(f"거래량급증+음봉({volume_ratio:.1f}x)")
 
     if sell_signals >= 2:
         # 소수익 구간(0% ~ TECHNICAL_EXIT_MIN_PCT)에서는 기술적 신호 청산 차단
         # → 조기 청산 방지, 손실 중이거나 충분한 수익이면 정상 청산
         min_exit_pct = getattr(config, "TECHNICAL_EXIT_MIN_PCT", 0.0) * 100
         if current_pnl_pct < 0 or current_pnl_pct >= min_exit_pct:
-            return {"should_sell": True, "reason": f"기술적 매도 신호 {sell_signals}개"}
+            return {"should_sell": True, "reason": f"기술적 매도 신호: {'+'.join(sell_reasons)}"}
 
     return {"should_sell": False, "reason": ""}

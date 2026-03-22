@@ -419,6 +419,33 @@ def get_walkforward_run(run_id: int) -> dict | None:
 
 # ── 실거래 / 모의거래 세션 & 거래 기록 ─────────────────────────────
 
+def get_last_paper_capital(fallback: float = 1_000_000) -> float:
+    """
+    봇 재시작 시 이전 모의잔고를 복원합니다.
+
+    balance_snapshots에서 mode='paper'인 가장 최근 비-startup 레코드의
+    krw_balance를 반환합니다.
+    - sell / shutdown / buy 트리거 기준 (startup은 초기값이라 제외)
+    - 기록이 없으면 fallback(기본 100만원) 반환
+    """
+    try:
+        init_db()
+        with _connect() as conn:
+            row = conn.execute("""
+                SELECT krw_balance
+                FROM balance_snapshots
+                WHERE mode = 'paper'
+                  AND trigger != 'startup'
+                ORDER BY snapshot_at DESC
+                LIMIT 1
+            """).fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+    except Exception:
+        pass
+    return fallback
+
+
 def start_trading_session(mode: str, config) -> int:
     init_db()
     cfg_json = json.dumps({

@@ -63,15 +63,19 @@ class Trader:
         self._pending_entry: dict[str, Any] | None = None
         self._pending_trade_amount: float = 0.0
 
-        # 페이퍼 자금
-        self.paper_capital = 1_000_000
+        # 페이퍼 자금 — 이전 세션 잔고 자동 복원 (없으면 초기값 100만원)
+        if config.PAPER_TRADING:
+            self.paper_capital = _bdb.get_last_paper_capital(fallback=1_000_000)
+        else:
+            self.paper_capital = 1_000_000  # 실거래 모드는 실제 잔고 사용
 
         # DB 세션 ID (봇 실행마다 고유, 거래 기록 연결용)
         mode = 'paper' if config.PAPER_TRADING else 'live'
         self._db_session_id = _bdb.start_trading_session(mode, config)
         _bdb.record_balance(
             session_id=self._db_session_id, trigger='startup', mode=mode,
-            krw_balance=self.paper_capital, note='봇 시작',
+            krw_balance=self.paper_capital,
+            note=f'봇 시작 (이전잔고 복원: {self.paper_capital:,.0f}원)',
         )
 
         # 동적 조정 카운터 (매 N사이클마다 익절/손절 재평가)
@@ -119,6 +123,8 @@ class Trader:
         print(f"  체크 주기: {self.config.CHECK_INTERVAL}초")
         print(f"  진입 최소 신호: {self.config.MIN_SIGNAL_COUNT}개 이상")
         print(f"  손절: {self.config.STOP_LOSS_PCT*100:.1f}% | 익절: {self.config.TAKE_PROFIT_PCT*100:.1f}%")
+        if self.config.PAPER_TRADING:
+            print(f"  💰 모의잔고: {self.paper_capital:,.0f}원 (이전 세션에서 복원)")
         print(f"{'='*60}\n")
 
         # 이전 실행 상태 복구 시도 (비정상 종료 후 재시작 시)
@@ -330,26 +336,48 @@ class Trader:
             print(f"  ❌ {best_market} 진입가 분석 실패")
             return
 
+        # ── 리스크/리워드 비율 검증 (Paul Tudor Jones: R/R 최소 1.5:1) ──
+        tp_pct = entry_info["tp_pct"]
+        sl_pct = abs(entry_info["sl_pct"])
+        rr_ratio = tp_pct / sl_pct if sl_pct > 0 else 0
+        min_rr = getattr(self.config, "MIN_RR_RATIO", 1.5)
+        if rr_ratio < min_rr:
+            print(
+                f"  ⛔ R/R 비율 불충분 ({rr_ratio:.1f}x < {min_rr}x) "
+                f"[TP={tp_pct:.1f}% / SL={sl_pct:.1f}%] → 다음 사이클 대기"
+            )
+            return
+
         print(f"\n  📊 진입가 분석 결과:")
         print(f"    현재가      : {fmt_price(entry_info['current_price']):>12}원")
         print(f"    진입가      : {fmt_price(entry_info['entry_price']):>12}원 ({entry_info['method']})")
         print(f"    할인율      : {entry_info['discount_pct']:>12.2f}%")
         print(f"    익절 목표   : {fmt_price(entry_info['tp_price']):>12}원 ({entry_info['tp_pct']:+.2f}%)")
         print(f"    손절 기준   : {fmt_price(entry_info['sl_price']):>12}원 ({entry_info['sl_pct']:+.2f}%)")
+        print(f"    R/R 비율    : {rr_ratio:>12.2f}x")
         print(f"    지지선      : {', '.join(fmt_price(s) for s in entry_info['support_levels'])}")
 
         # 지정가 매수 주문 설정 — 잔고 비례 or 고정금액
         trade_amount = self._calc_trade_amount()
         if self.config.PAPER_TRADING:
             trade_amount = min(trade_amount, self.paper_capital * 0.95)
-        if trade_amount < 5000:
+
+        # 물타기(SCALED_ENTRY) 사용 시: 1차 매수는 전체 금액의 일부만 투입
+        # SCALED_ENTRY_1ST_RATIO 설정이 실제로 반영되도록 수정
+        if getattr(self.config, "SCALED_ENTRY", False):
+            first_ratio = getattr(self.config, "SCALED_ENTRY_1ST_RATIO", 0.5)
+            first_amount = trade_amount * first_ratio
+        else:
+            first_amount = trade_amount
+
+        if first_amount < 5000:
             logger.warning("매수 금액이 최소 주문금액(5,000원) 미만")
             return
 
         order = self.order_mgr.place_limit_buy(
             best_market,
             entry_info["entry_price"],
-            trade_amount,
+            first_amount,
         )
         if order is None:
             return
@@ -357,7 +385,7 @@ class Trader:
         # 상태 전이: IDLE → BUY_WAITING
         self.state = STATE_BUY_WAITING
         self._pending_entry = entry_info
-        self._pending_trade_amount = trade_amount
+        self._pending_trade_amount = trade_amount  # 전체 투자금 (DCA 비율 계산 기준)
         print(f"\n  📝 지정가 매수 주문 설정 완료 → 체결 대기 중...")
 
     def _handle_buy_waiting(self, now: str):
@@ -427,9 +455,10 @@ class Trader:
         self.current_market = market
 
         fee = order["fee"]
+        actual_buy_amount = order.get("amount_krw", self._pending_trade_amount)
         if self.config.PAPER_TRADING:
-            # 매수금액 + 수수료를 함께 차감 (실거래 시뮬레이션)
-            self.paper_capital -= (self._pending_trade_amount + fee)
+            # 실제 매수금액 + 수수료 차감 (SCALED_ENTRY 시 1차 매수금액 기준)
+            self.paper_capital -= (actual_buy_amount + fee)
 
         # 신호 점수 기록
         df = pyupbit.get_ohlcv(
@@ -993,7 +1022,7 @@ class Trader:
                     status["pending_buy_amount"] = self._pending_trade_amount
 
             if self.state == STATE_POSITION and self.entry_price > 0:
-                current_price = self.api_client.get_current_price(self.current_market) or self.entry_price
+                current_price = self.client.get_current_price(self.current_market) or self.entry_price
                 avg_price = self._avg_entry_price if self._avg_entry_price > 0 else self.entry_price
                 unrealized_pct = (current_price - avg_price) / avg_price * 100
                 unrealized_krw = (current_price - avg_price) * self.coin_qty

@@ -14,6 +14,7 @@ import time
 import logging
 import pandas as pd
 import pyupbit
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from indicators import add_all_indicators, get_signal_score
 
@@ -90,6 +91,7 @@ class MarketScanner:
         반환: {
             'market': str,
             'signal_score': int,       # 기술적 신호 수 (0~5)
+            'signal_strength': float,  # 신호 강도 합계 (0~5.0)
             'opportunity_score': float, # 종합 기회 점수
             'signals': dict,
             'details': dict,
@@ -139,17 +141,22 @@ class MarketScanner:
             else:
                 rsi_score = max(0, (70 - rsi) / 70)
 
-            # 종합 기회 점수
+            # 신호 강도 점수 (개선됨: 신호 강도 반영)
+            signal_strength = signal_result.get("strength", signal_result["score"])
+
+            # 종합 기회 점수 (신호 강도 추가 반영)
             opportunity_score = (
-                signal_result["score"] * 2.0   # 신호 수 (최대 10점)
-                + volatility_score * 2.0         # 변동성 (최대 2점)
-                + bb_score * 1.5                 # 밴드 위치 (최대 1.5점)
-                + rsi_score * 1.5                # RSI (최대 1.5점)
+                signal_result["score"] * 2.0    # 신호 수 (최대 10점)
+                + signal_strength * 0.5          # 신호 강도 보너스 (최대 2.5점)
+                + volatility_score * 1.5         # 변동성 (최대 1.5점)
+                + bb_score * 1.0                 # 밴드 위치 (최대 1.0점)
+                + rsi_score * 1.0                # RSI (최대 1.0점)
             )
 
             return {
                 "market": market,
                 "signal_score": signal_result["score"],
+                "signal_strength": signal_strength,
                 "opportunity_score": opportunity_score,
                 "signals": signal_result["signals"],
                 "details": signal_result["details"],
@@ -195,14 +202,31 @@ class MarketScanner:
             else:
                 markets = all_markets[:30]  # 폴백: 상위 30개만
 
-        # 각 마켓 스코어 계산
+        # 각 마켓 스코어 계산 (병렬 처리 — API 레이트 리밋 분산)
         results = []
-        for i, market in enumerate(markets):
-            print(f"   [{i+1}/{len(markets)}] {market} 분석 중...", end="\r")
-            score_data = self.score_market(market)
-            if score_data and score_data["signal_score"] >= 1:  # 최소 1개 신호 이상
-                results.append(score_data)
-            time.sleep(0.08)  # API 레이트 리밋
+        max_workers = min(5, len(markets))  # 최대 5개 스레드 (업비트 레이트 리밋 고려)
+
+        def _score_delayed(idx_market):
+            idx, market = idx_market
+            time.sleep(idx * 0.12)  # 요청 분산: 0.12초 간격 stagger
+            return self.score_market(market)
+
+        print(f"   {len(markets)}개 마켓 병렬 분석 중 (스레드 {max_workers}개)...")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_score_delayed, (i, m)): m
+                for i, m in enumerate(markets)
+            }
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                print(f"   [{done_count}/{len(markets)}] 분석 완료...", end="\r")
+                try:
+                    score_data = future.result()
+                    if score_data and score_data["signal_score"] >= 1:
+                        results.append(score_data)
+                except Exception as e:
+                    logger.debug(f"스코어 계산 오류 (무시): {e}")
 
         print()  # 줄바꿈
 
@@ -231,7 +255,11 @@ class MarketScanner:
         for candidate in candidates:
             if candidate["signal_score"] >= min_signal_score:
                 selected = candidate["market"]
-                print(f"\n✅ 선택된 마켓: {selected} (신호점수={candidate['signal_score']}/5, 기회점수={candidate['opportunity_score']:.2f})")
+                strength = candidate.get("signal_strength", candidate["signal_score"])
+                print(
+                    f"\n✅ 선택된 마켓: {selected} "
+                    f"(신호={candidate['signal_score']}/5, 강도={strength:.1f}, 기회점수={candidate['opportunity_score']:.2f})"
+                )
                 return selected
 
         print(f"\n⏸️  현재 진입 조건 충족 마켓 없음 (신호점수 {min_signal_score}개 이상 필요)")
@@ -241,16 +269,18 @@ class MarketScanner:
         if not results:
             print("   스캔 결과 없음")
             return
-        print(f"\n  {'마켓':<12} {'기회점수':>8} {'신호':>6} {'RSI':>6} {'ATR%':>6} {'BB%':>6}")
-        print("  " + "-" * 55)
+        print(f"\n  {'마켓':<12} {'기회점수':>8} {'강도':>6} {'신호':>6} {'RSI':>6} {'ATR%':>6} {'BB%':>6}")
+        print("  " + "-" * 63)
         for r in results:
             signals_str = "".join(
                 "●" if v else "○"
                 for v in r["signals"].values()
             )
+            strength = r.get("signal_strength", r["signal_score"])
             print(
                 f"  {r['market']:<12} {r['opportunity_score']:>8.2f} "
+                f"{strength:>6.1f} "
                 f"{signals_str} "
                 f"{r['rsi']:>6.1f} {r['atr_pct']:>6.2f} {r['bb_pct']:>6.2f}"
             )
-        print("  (● = 신호 ON | ○ = 신호 OFF | 순서: RSI·MACD·BB·EMA·거래량)")
+        print("  (● = 신호 ON | ○ = 신호 OFF | 강도 = 신호 품질 합계 | 순서: RSI·MACD·BB·EMA·거래량)")
