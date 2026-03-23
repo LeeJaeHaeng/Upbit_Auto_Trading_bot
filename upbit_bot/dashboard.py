@@ -783,11 +783,52 @@ if page == "🔴 실시간 현황":
         kpi_cols[2].metric("미실현 손익", "—")
         kpi_cols[3].metric("현재가", "—")
 
-    # ── 실제 보유 코인 현황 ──
+    # ── 보유 코인 현황 (페이퍼 포지션 + 실제 지갑) ──
     st.markdown("---")
-    st.subheader("💼 실제 보유 코인 현황")
-    st.caption("업비트 실제 지갑 기준 | 목표가·손절가는 봇 활성 포지션 코인에만 표시 | 20초 캐시")
+    st.subheader("💼 보유 코인 현황")
 
+    # ▶ 페이퍼 트레이딩 포지션
+    _is_paper = live.get("mode", "paper") == "paper"
+    if _is_paper:
+        st.caption("📄 페이퍼 트레이딩 포지션")
+        if raw_state == "position" and live.get("entry_price"):
+            _p_market   = live.get("market", "")
+            _p_avg      = live.get("avg_entry_price") or live.get("entry_price", 0)
+            _p_qty      = live.get("coin_qty", 0)
+            _p_cur      = live.get("current_price", 0)
+            _p_eval     = live.get("position_value_krw", 0)
+            _p_upnl_krw = live.get("unrealized_krw", 0)
+            _p_upnl_pct = live.get("unrealized_pct", 0)
+            _p_tp       = live.get("tp_price", 0)
+            _p_sl       = live.get("sl_price", 0)
+
+            def _dist(target, base):
+                if target and base:
+                    return f"  ({(target - base) / base * 100:+.2f}%)"
+                return ""
+
+            _p_tp_str = f"{fmt_price(_p_tp)}{_dist(_p_tp, _p_cur)}" if _p_tp else "—"
+            _p_sl_str = f"{fmt_price(_p_sl)}{_dist(_p_sl, _p_cur)}" if _p_sl else "—"
+
+            _paper_df = pd.DataFrame([{
+                "코인":       _p_market.replace("KRW-", ""),
+                "수량":       f"{_p_qty:.8f}".rstrip("0").rstrip("."),
+                "매수가":     fmt_price(_p_avg),
+                "현재가":     fmt_price(_p_cur),
+                "평가액":     f"{_p_eval:,.0f} 원",
+                "미실현손익": f"{_p_upnl_krw:+,.0f} 원",
+                "수익률":     f"{_p_upnl_pct:+.2f}%",
+                "목표가 TP":  _p_tp_str,
+                "손절가 SL":  _p_sl_str,
+            }])
+            st.dataframe(_paper_df, use_container_width=True, hide_index=True)
+        elif raw_state == "buy_waiting":
+            st.info(f"⏳ **{live.get('market', '')}** 매수 주문 대기 중 — 체결 후 포지션이 여기 표시됩니다.")
+        else:
+            st.info("현재 보유 중인 포지션이 없습니다.")
+
+    # ▶ 실제 업비트 지갑
+    st.caption("💰 실제 업비트 지갑")
     _access_key = getattr(cfg, "ACCESS_KEY", "YOUR_ACCESS_KEY")
     if _access_key in ("YOUR_ACCESS_KEY", "", None):
         st.info("💡 `.env`에 API 키를 설정하면 실제 보유 코인이 여기에 표시됩니다.")
@@ -796,58 +837,45 @@ if page == "🔴 실시간 현황":
         _coin_wallet = [w for w in _wallet if w["currency"] != "KRW"]
         _krw_wallet  = next((w for w in _wallet if w["currency"] == "KRW"), None)
 
-        # 봇 포지션과 TP/SL 연결
-        _pos_mkt = live.get("market", "") if raw_state == "position" else ""
-        _pos_tp  = live.get("tp_price", 0) if raw_state == "position" else 0
-        _pos_sl  = live.get("sl_price", 0) if raw_state == "position" else 0
-        _pos_avg = live.get("avg_entry_price") or live.get("entry_price", 0) if raw_state == "position" else 0
+        # 실거래 모드일 때만 봇 포지션 TP/SL 연결 (페이퍼는 위 섹션에서 이미 처리)
+        _pos_mkt = live.get("market", "") if (raw_state == "position" and not _is_paper) else ""
+        _pos_tp  = live.get("tp_price", 0) if (raw_state == "position" and not _is_paper) else 0
+        _pos_sl  = live.get("sl_price", 0) if (raw_state == "position" and not _is_paper) else 0
 
         if _coin_wallet:
-            # 총 평가액 KPI
             _total_eval = sum(w["eval_krw"] for w in _coin_wallet)
             _total_pnl  = sum(w["pnl_krw"]  for w in _coin_wallet)
             _kw1, _kw2, _kw3 = st.columns(3)
             _kw1.metric("코인 평가총액", f"{_total_eval:,.0f} 원")
-            _kw2.metric("평가손익 합계", f"{_total_pnl:+,.0f} 원",
-                        delta_color="normal")
+            _kw2.metric("평가손익 합계", f"{_total_pnl:+,.0f} 원", delta_color="normal")
             if _krw_wallet:
                 _kw3.metric("KRW 잔고", f"{_krw_wallet['eval_krw']:,.0f} 원")
 
-            # 코인별 상세 테이블
             _table_rows = []
             for _w in sorted(_coin_wallet, key=lambda x: x["eval_krw"], reverse=True):
                 _mkt_w = f"KRW-{_w['currency']}"
-                _is_bot_pos = (_mkt_w == _pos_mkt)
-
-                # TP/SL 까지 거리 계산
+                _is_bot = (_mkt_w == _pos_mkt)
                 _tp_str = "—"
                 _sl_str = "—"
-                if _is_bot_pos:
+                if _is_bot:
                     if _pos_tp and _w["cur_price"]:
-                        _tp_dist = (_pos_tp - _w["cur_price"]) / _w["cur_price"] * 100
-                        _tp_str = f"{fmt_price(_pos_tp)}  ({_tp_dist:+.2f}%)"
+                        _tp_str = f"{fmt_price(_pos_tp)}  ({(_pos_tp - _w['cur_price']) / _w['cur_price'] * 100:+.2f}%)"
                     if _pos_sl and _w["cur_price"]:
-                        _sl_dist = (_pos_sl - _w["cur_price"]) / _w["cur_price"] * 100
-                        _sl_str = f"{fmt_price(_pos_sl)}  ({_sl_dist:+.2f}%)"
-
-                # 봇 포지션 코인이면 이름에 봇 마크
-                _label = f"🤖 {_w['currency']}" if _is_bot_pos else _w["currency"]
+                        _sl_str = f"{fmt_price(_pos_sl)}  ({(_pos_sl - _w['cur_price']) / _w['cur_price'] * 100:+.2f}%)"
 
                 _table_rows.append({
-                    "코인":         _label,
-                    "수량":         f"{_w['qty']:.8f}".rstrip("0").rstrip("."),
-                    "매수가":       fmt_price(_w["avg_buy"]) if _w["avg_buy"] else "—",
-                    "현재가":       fmt_price(_w["cur_price"]),
-                    "평가액":       f"{_w['eval_krw']:,.0f} 원",
-                    "손익(원)":     f"{_w['pnl_krw']:+,.0f} 원",
-                    "수익률":       f"{_w['pnl_pct']:+.2f}%",
-                    "목표가 TP":    _tp_str,
-                    "손절가 SL":    _sl_str,
+                    "코인":       ("🤖 " if _is_bot else "") + _w["currency"],
+                    "수량":       f"{_w['qty']:.8f}".rstrip("0").rstrip("."),
+                    "매수가":     fmt_price(_w["avg_buy"]) if _w["avg_buy"] else "—",
+                    "현재가":     fmt_price(_w["cur_price"]),
+                    "평가액":     f"{_w['eval_krw']:,.0f} 원",
+                    "손익(원)":   f"{_w['pnl_krw']:+,.0f} 원",
+                    "수익률":     f"{_w['pnl_pct']:+.2f}%",
+                    "목표가 TP":  _tp_str,
+                    "손절가 SL":  _sl_str,
                 })
 
-            _df_wallet = pd.DataFrame(_table_rows)
-            st.dataframe(_df_wallet, use_container_width=True, hide_index=True)
-
+            st.dataframe(pd.DataFrame(_table_rows), use_container_width=True, hide_index=True)
         else:
             st.info("보유 중인 코인이 없습니다. (100원 미만 소액 제외)")
             if _krw_wallet:
