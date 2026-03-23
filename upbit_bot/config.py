@@ -20,7 +20,7 @@ SECRET_KEY = os.environ.get("UPBIT_SECRET_KEY", "YOUR_SECRET_KEY")
 # =====================================================
 MARKET = "KRW-BTC"          # 거래 마켓 (비트코인/원화)
 TRADE_AMOUNT_KRW = 100_000  # 고정 거래금액 (TRADE_AMOUNT_PCT=0 일 때 사용)
-TRADE_AMOUNT_PCT = 0.10     # 총 자금 대비 투자 비율 (10%). 0이면 고정금액 사용
+TRADE_AMOUNT_PCT = 0.50     # 총 자금 대비 투자 비율 (50%). 0이면 고정금액 사용
 TRADE_AMOUNT_MIN = 10_000   # 최소 투자금 (원)
 TRADE_AMOUNT_MAX = 500_000  # 최대 투자금 (원) — 잔고가 커도 이 이상 투자 안 함
 FEE_RATE = 0.0005           # 업비트 수수료 0.05%
