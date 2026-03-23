@@ -192,6 +192,62 @@ def load_market_environment(market: str) -> dict:
     return env.get_market_score(market)
 
 
+@st.cache_data(ttl=20)
+def load_live_wallet() -> list:
+    """실제 업비트 보유 코인 조회 (20초 캐시). 현재가 포함."""
+    access_key = getattr(cfg, "ACCESS_KEY", "YOUR_ACCESS_KEY")
+    secret_key = getattr(cfg, "SECRET_KEY", "YOUR_SECRET_KEY")
+    if access_key in ("YOUR_ACCESS_KEY", "", None):
+        return []
+    try:
+        _upbit = pyupbit.Upbit(access_key, secret_key)
+        bals = _upbit.get_balances()
+        if not bals:
+            return []
+        valid_krw = set(pyupbit.get_tickers(fiat="KRW") or [])
+        mkt_list = [
+            f"KRW-{b['currency']}" for b in bals
+            if b.get("currency") != "KRW"
+            and (float(b.get("balance") or 0) + float(b.get("locked") or 0)) > 0
+            and f"KRW-{b['currency']}" in valid_krw
+        ]
+        prices = {}
+        if mkt_list:
+            pr = pyupbit.get_current_price(mkt_list)
+            if isinstance(pr, dict):
+                prices = pr
+            elif pr and len(mkt_list) == 1:
+                prices = {mkt_list[0]: pr}
+
+        rows = []
+        for b in bals:
+            currency = b.get("currency", "")
+            qty = float(b.get("balance") or 0) + float(b.get("locked") or 0)
+            avg_buy = float(b.get("avg_buy_price") or 0)
+            if currency == "KRW":
+                rows.append({"currency": "KRW", "qty": qty, "avg_buy": 0,
+                              "cur_price": 1.0, "eval_krw": qty,
+                              "pnl_krw": 0, "pnl_pct": 0})
+                continue
+            if qty <= 0:
+                continue
+            market = f"KRW-{currency}"
+            cur_price = float(prices.get(market) or 0)
+            eval_krw = qty * cur_price
+            if eval_krw < 100:
+                continue
+            pnl_krw = (cur_price - avg_buy) * qty if avg_buy > 0 else 0
+            pnl_pct = (cur_price - avg_buy) / avg_buy * 100 if avg_buy > 0 else 0
+            rows.append({
+                "currency": currency, "qty": qty, "avg_buy": avg_buy,
+                "cur_price": cur_price, "eval_krw": eval_krw,
+                "pnl_krw": pnl_krw, "pnl_pct": pnl_pct,
+            })
+        return rows
+    except Exception:
+        return []
+
+
 # ──────────────────────────────────────
 # 뉴스 크롤링
 # ──────────────────────────────────────
@@ -726,6 +782,76 @@ if page == "🔴 실시간 현황":
         kpi_cols[1].metric("포지션", "없음")
         kpi_cols[2].metric("미실현 손익", "—")
         kpi_cols[3].metric("현재가", "—")
+
+    # ── 실제 보유 코인 현황 ──
+    st.markdown("---")
+    st.subheader("💼 실제 보유 코인 현황")
+    st.caption("업비트 실제 지갑 기준 | 목표가·손절가는 봇 활성 포지션 코인에만 표시 | 20초 캐시")
+
+    _access_key = getattr(cfg, "ACCESS_KEY", "YOUR_ACCESS_KEY")
+    if _access_key in ("YOUR_ACCESS_KEY", "", None):
+        st.info("💡 `.env`에 API 키를 설정하면 실제 보유 코인이 여기에 표시됩니다.")
+    else:
+        _wallet = load_live_wallet()
+        _coin_wallet = [w for w in _wallet if w["currency"] != "KRW"]
+        _krw_wallet  = next((w for w in _wallet if w["currency"] == "KRW"), None)
+
+        # 봇 포지션과 TP/SL 연결
+        _pos_mkt = live.get("market", "") if raw_state == "position" else ""
+        _pos_tp  = live.get("tp_price", 0) if raw_state == "position" else 0
+        _pos_sl  = live.get("sl_price", 0) if raw_state == "position" else 0
+        _pos_avg = live.get("avg_entry_price") or live.get("entry_price", 0) if raw_state == "position" else 0
+
+        if _coin_wallet:
+            # 총 평가액 KPI
+            _total_eval = sum(w["eval_krw"] for w in _coin_wallet)
+            _total_pnl  = sum(w["pnl_krw"]  for w in _coin_wallet)
+            _kw1, _kw2, _kw3 = st.columns(3)
+            _kw1.metric("코인 평가총액", f"{_total_eval:,.0f} 원")
+            _kw2.metric("평가손익 합계", f"{_total_pnl:+,.0f} 원",
+                        delta_color="normal")
+            if _krw_wallet:
+                _kw3.metric("KRW 잔고", f"{_krw_wallet['eval_krw']:,.0f} 원")
+
+            # 코인별 상세 테이블
+            _table_rows = []
+            for _w in sorted(_coin_wallet, key=lambda x: x["eval_krw"], reverse=True):
+                _mkt_w = f"KRW-{_w['currency']}"
+                _is_bot_pos = (_mkt_w == _pos_mkt)
+
+                # TP/SL 까지 거리 계산
+                _tp_str = "—"
+                _sl_str = "—"
+                if _is_bot_pos:
+                    if _pos_tp and _w["cur_price"]:
+                        _tp_dist = (_pos_tp - _w["cur_price"]) / _w["cur_price"] * 100
+                        _tp_str = f"{fmt_price(_pos_tp)}  ({_tp_dist:+.2f}%)"
+                    if _pos_sl and _w["cur_price"]:
+                        _sl_dist = (_pos_sl - _w["cur_price"]) / _w["cur_price"] * 100
+                        _sl_str = f"{fmt_price(_pos_sl)}  ({_sl_dist:+.2f}%)"
+
+                # 봇 포지션 코인이면 이름에 봇 마크
+                _label = f"🤖 {_w['currency']}" if _is_bot_pos else _w["currency"]
+
+                _table_rows.append({
+                    "코인":         _label,
+                    "수량":         f"{_w['qty']:.8f}".rstrip("0").rstrip("."),
+                    "매수가":       fmt_price(_w["avg_buy"]) if _w["avg_buy"] else "—",
+                    "현재가":       fmt_price(_w["cur_price"]),
+                    "평가액":       f"{_w['eval_krw']:,.0f} 원",
+                    "손익(원)":     f"{_w['pnl_krw']:+,.0f} 원",
+                    "수익률":       f"{_w['pnl_pct']:+.2f}%",
+                    "목표가 TP":    _tp_str,
+                    "손절가 SL":    _sl_str,
+                })
+
+            _df_wallet = pd.DataFrame(_table_rows)
+            st.dataframe(_df_wallet, use_container_width=True, hide_index=True)
+
+        else:
+            st.info("보유 중인 코인이 없습니다. (100원 미만 소액 제외)")
+            if _krw_wallet:
+                st.caption(f"💵 KRW 잔고: {_krw_wallet['eval_krw']:,.0f} 원")
 
     # ── 최근 거래 내역 (실시간 현황 하단) ──
     st.markdown("---")
