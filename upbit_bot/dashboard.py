@@ -871,9 +871,8 @@ if page == "🔴 실시간 현황":
             st.dataframe(pd.DataFrame(_pos_rows), use_container_width=True, hide_index=True)
 
             # ── 자산 요약 ──
-            _free_cash = paper_capital  # DB/live_status 에서 가져온 미투자 현금 잔고
-            _grand_total = _free_cash + _total_coin_eval
-            _sum_c1, _sum_c2, _sum_c3 = st.columns(3)
+            _free_cash = paper_capital
+            _sum_c1, _sum_c2 = st.columns(2)
             _sum_c1.metric(
                 "코인 평가액 합계",
                 f"{_total_coin_eval:,.0f} 원",
@@ -884,26 +883,13 @@ if page == "🔴 실시간 현황":
                 f"{_free_cash:,.0f} 원",
                 help="아직 코인을 사지 않은 남은 현금",
             )
-            _sum_c3.metric(
-                "모의 총자산",
-                f"{_grand_total:,.0f} 원",
-                delta=f"{(_grand_total / 1_000_000 - 1) * 100:+.2f}% (초기 100만원 대비)",
-                delta_color="normal",
-                help="코인 평가액 + 미투자 잔고",
-            )
 
         elif raw_state == "buy_waiting":
             st.info(f"⏳ **{live.get('market', '')}** 매수 주문 대기 중 — 체결 후 포지션이 여기 표시됩니다.")
-            _sum_c1, _sum_c2 = st.columns(2)
-            _sum_c1.metric("미투자 모의잔고", f"{paper_capital:,.0f} 원")
-            _sum_c2.metric("모의 총자산", f"{paper_capital:,.0f} 원",
-                           delta=f"{(paper_capital / 1_000_000 - 1) * 100:+.2f}%", delta_color="normal")
+            st.metric("미투자 모의잔고", f"{paper_capital:,.0f} 원")
         else:
             st.info("현재 보유 중인 포지션이 없습니다.")
-            _sc1, _sc2 = st.columns(2)
-            _sc1.metric("미투자 모의잔고", f"{paper_capital:,.0f} 원")
-            _sc2.metric("모의 총자산", f"{paper_capital:,.0f} 원",
-                        delta=f"{(paper_capital / 1_000_000 - 1) * 100:+.2f}%", delta_color="normal")
+            st.metric("미투자 모의잔고", f"{paper_capital:,.0f} 원")
 
     # ▶ 실제 업비트 지갑
     st.caption("💰 실제 업비트 지갑")
