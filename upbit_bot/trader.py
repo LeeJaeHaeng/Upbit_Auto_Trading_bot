@@ -537,7 +537,7 @@ class Trader:
                 trigger_p = self.entry_price * (1 - dip_pct)
                 add_amount = self._pending_trade_amount * add_ratio
                 self._dca_levels_pending.append((trigger_p, add_amount))
-            msgs = [f"{d*100:.1f}%↓={fmt_price(p)}" for (p, _) in self._dca_levels_pending]
+            msgs = [f"{(self.entry_price - p) / self.entry_price * 100:.1f}%↓={fmt_price(p)}" for (p, _) in self._dca_levels_pending]
             print(f"  💧 물타기 설정 ({len(self._dca_levels_pending)}단계): {' / '.join(msgs)} | 만료={timeout_min}분")
         # ── 불타기 피라미딩 초기화 ──
         if getattr(self.config, "PYRAMID_ENABLED", False):
