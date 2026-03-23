@@ -791,6 +791,8 @@ if page == "🔴 실시간 현황":
     _is_paper = live.get("mode", "paper") == "paper"
     if _is_paper:
         st.caption("📄 페이퍼 트레이딩 포지션")
+
+        # live_status에서 실시간 포지션 데이터 가져오기 (봇 실행 중 + POSITION 상태)
         if raw_state == "position" and live.get("entry_price"):
             _p_market   = live.get("market", "")
             _p_avg      = live.get("avg_entry_price") or live.get("entry_price", 0)
@@ -801,6 +803,33 @@ if page == "🔴 실시간 현황":
             _p_upnl_pct = live.get("unrealized_pct", 0)
             _p_tp       = live.get("tp_price", 0)
             _p_sl       = live.get("sl_price", 0)
+            _from_db    = False
+        else:
+            # 봇이 IDLE/정지 상태여도 DB에서 마지막 미청산 포지션 복원
+            try:
+                import backtest_db as _bdb_pos
+                _db_pos = _bdb_pos.get_last_paper_position()
+            except Exception:
+                _db_pos = None
+
+            if _db_pos:
+                _p_market   = _db_pos["market"]
+                _p_qty      = _db_pos["coin_qty"]
+                _p_avg      = _db_pos["entry_price"]
+                _p_cur      = get_realtime_price(_p_market) if _p_market else 0
+                _p_eval     = _p_qty * _p_cur
+                _p_upnl_krw = (_p_cur - _p_avg) * _p_qty if _p_avg > 0 else 0
+                _p_upnl_pct = (_p_cur - _p_avg) / _p_avg * 100 if _p_avg > 0 else 0
+                _p_tp       = 0  # 봇 정지 상태라 TP/SL 미상
+                _p_sl       = 0
+                _from_db    = True
+            else:
+                _p_market = None
+                _from_db  = False
+
+        if _p_market:
+            if _from_db:
+                st.warning("봇이 IDLE/정지 상태입니다. DB에서 마지막 미청산 포지션을 복원해 표시합니다. (TP/SL 미상)")
 
             def _dist(target, base):
                 if target and base:

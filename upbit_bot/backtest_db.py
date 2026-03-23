@@ -446,6 +446,61 @@ def get_last_paper_capital(fallback: float = 1_000_000) -> float:
     return fallback
 
 
+def get_last_paper_position() -> dict | None:
+    """
+    DB에서 마지막으로 기록된 페이퍼 매수 포지션 반환.
+    마지막 buy 이후 sell이 없으면 미청산 포지션으로 판단.
+
+    반환: {"market", "coin_qty", "entry_price", "snapshot_at"} 또는 None
+    """
+    import re
+    try:
+        init_db()
+        with _connect() as conn:
+            buy_row = conn.execute("""
+                SELECT snapshot_at, coin_market, coin_qty, note
+                FROM balance_snapshots
+                WHERE mode = 'paper'
+                  AND trigger = 'buy'
+                  AND coin_market IS NOT NULL
+                  AND coin_qty > 0
+                ORDER BY snapshot_at DESC
+                LIMIT 1
+            """).fetchone()
+            if not buy_row:
+                return None
+
+            # 마지막 buy 이후에 sell이 있는지 확인
+            sell_after = conn.execute("""
+                SELECT 1 FROM balance_snapshots
+                WHERE mode = 'paper'
+                  AND trigger = 'sell'
+                  AND snapshot_at > ?
+                LIMIT 1
+            """, (buy_row["snapshot_at"],)).fetchone()
+            if sell_after:
+                return None  # 이미 매도됨
+
+            # note에서 진입가 파싱: "매수 KRW-WCT 96원" 형태
+            entry_price = 0.0
+            if buy_row["note"]:
+                m = re.search(r'([\d,\.]+)원', buy_row["note"])
+                if m:
+                    try:
+                        entry_price = float(m.group(1).replace(",", ""))
+                    except ValueError:
+                        pass
+
+            return {
+                "market":      buy_row["coin_market"],
+                "coin_qty":    float(buy_row["coin_qty"]),
+                "entry_price": entry_price,
+                "snapshot_at": buy_row["snapshot_at"],
+            }
+    except Exception:
+        return None
+
+
 def start_trading_session(mode: str, config) -> int:
     init_db()
     cfg_json = json.dumps({
