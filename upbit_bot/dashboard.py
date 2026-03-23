@@ -643,6 +643,7 @@ def _load_live_status() -> dict:
 STATE_KO = {
     "idle":        ("🔍 IDLE",       "대기 중 — 매수 기회 탐색"),
     "buy_waiting": ("⏳ BUY_WAITING", "지정가 매수 주문 체결 대기"),
+    "buy_wait":    ("⏳ BUY_WAITING", "지정가 매수 주문 체결 대기"),
     "position":    ("📦 POSITION",   "포지션 보유 중 — 익절/손절 대기"),
     "stopped":     ("⏹ 정지",        "봇이 실행 중이지 않습니다"),
 }
@@ -715,84 +716,112 @@ if page == "🔴 실시간 현황":
             help="페이퍼 트레이딩 자산 추정치",
         )
 
-    if raw_state == "position" and live.get("entry_price"):
-        upnl_pct = live.get("unrealized_pct", 0)
-        upnl_krw = live.get("unrealized_krw", 0)
-        pos_val  = live.get("position_value_krw", 0)
-        cur_price = live.get("current_price", 0)
+    _live_positions = live.get("positions", [])
+    _live_pending   = live.get("pending_buys", [])
+
+    if _live_positions:
+        _total_upnl_krw = sum(p.get("unrealized_krw", 0) for p in _live_positions)
+        _total_pos_val  = sum(p.get("position_value_krw", 0) for p in _live_positions)
+        _pos_count = len(_live_positions)
+        _pend_count = len(_live_pending)
 
         kpi_cols[1].metric(
-            "미실현 손익",
-            f"{upnl_krw:+,.0f} 원",
-            delta=f"{upnl_pct:+.2f}%",
+            "미실현 손익 합계",
+            f"{_total_upnl_krw:+,.0f} 원",
             delta_color="normal",
         )
-        kpi_cols[2].metric("포지션 평가액", f"{pos_val:,.0f} 원")
-        kpi_cols[3].metric("현재가", fmt_price(cur_price))
-
-        st.markdown("---")
-
-        # ── 포지션 상세 ──
-        st.subheader(f"📦 포지션 상세 — {live.get('market', '')}")
-
-        avg_price = live.get("avg_entry_price") or live.get("entry_price", 0)
-        entry_price = live.get("entry_price", 0)
-        coin_qty = live.get("coin_qty", 0)
-        highest_price = live.get("highest_price", 0)
-        tp_price = live.get("tp_price", 0)
-        sl_price = live.get("sl_price", 0)
-        dca_done = live.get("dca_done", False)
-        be_activated = live.get("breakeven_activated", False)
-
-        col_d1, col_d2, col_d3 = st.columns(3)
-        with col_d1:
-            st.markdown("**진입 정보**")
-            st.write(f"- 1차 매수가: **{entry_price:,.0f}** 원")
-            if dca_done:
-                st.write(f"- 평균단가 (DCA): **{avg_price:,.0f}** 원")
-            st.write(f"- 보유 수량: `{coin_qty:.8f}`")
-            st.write(f"- 고점: {highest_price:,.0f} 원")
-
-        with col_d2:
-            st.markdown("**TP / SL**")
-            if tp_price:
-                tp_dist = (tp_price - cur_price) / cur_price * 100
-                st.write(f"- 익절가 (TP): **{tp_price:,.0f}** 원  `{tp_dist:+.2f}%`")
-            if sl_price:
-                sl_dist = (sl_price - cur_price) / cur_price * 100
-                st.write(f"- 손절가 (SL): **{sl_price:,.0f}** 원  `{sl_dist:+.2f}%`")
-
-        with col_d3:
-            st.markdown("**기능 활성 여부**")
-            st.write(f"- DCA 2차 매수: {'✅ 완료' if dca_done else '⏳ 대기 중'}")
-            st.write(f"- 본전 보호 스탑: {'✅ 활성' if be_activated else '❌ 미활성'}")
-
-        # ── 진입가 / TP / SL / 현재가 시각화 ──
-        if all([avg_price, cur_price, tp_price, sl_price]):
-            st.markdown("**가격 레벨 시각화**")
-            level_data = pd.DataFrame({
-                "가격": [sl_price, avg_price, cur_price, tp_price],
-                "레이블": ["손절(SL)", "평균진입가", "현재가", "익절(TP)"],
-            }).set_index("레이블")
-            st.bar_chart(level_data, use_container_width=True, height=200)
-
-    elif raw_state == "buy_waiting":
-        market = live.get("market", "")
-        buy_price = live.get("pending_buy_price", 0)
-        buy_amount = live.get("pending_buy_amount", 0)
-        cur_price = pyupbit.get_current_price(market) if market else 0
-
-        kpi_cols[1].metric("대기 매수가", fmt_price(buy_price))
-        kpi_cols[2].metric("주문 금액", f"{buy_amount:,.0f} 원")
-        kpi_cols[3].metric("현재가", fmt_price(cur_price) if cur_price else "—")
-
-        st.markdown("---")
-        st.info(
-            f"**{market}** 지정가 매수 주문 대기 중\n\n"
-            f"주문가: **{fmt_price(buy_price)}** | 현재가: {fmt_price(cur_price)} | "
-            f"금액: {buy_amount:,.0f}원\n\n"
-            "현재가가 주문가 이하로 내려오면 체결됩니다. (최대 30분 대기)"
+        kpi_cols[2].metric("포지션 평가액", f"{_total_pos_val:,.0f} 원")
+        kpi_cols[3].metric(
+            "보유 포지션",
+            f"{_pos_count}개" + (f" (+대기 {_pend_count})" if _pend_count else ""),
         )
+
+        st.markdown("---")
+        st.subheader("📦 포지션 상세")
+
+        for p in _live_positions:
+            avg_price     = p.get("avg_entry_price") or p.get("entry_price", 0)
+            entry_price   = p.get("entry_price", 0)
+            cur_price     = p.get("current_price", 0)
+            coin_qty      = p.get("coin_qty", 0)
+            highest_price = p.get("highest_price", 0)
+            tp_price      = p.get("tp_price", 0)
+            sl_price      = p.get("sl_price", 0)
+            dca_done      = p.get("dca_done", False)
+            be_activated  = p.get("breakeven_activated", False)
+            upnl_pct      = p.get("unrealized_pct", 0)
+            upnl_krw      = p.get("unrealized_krw", 0)
+
+            with st.expander(
+                f"**{p['market']}** — {upnl_krw:+,.0f}원 ({upnl_pct:+.2f}%)",
+                expanded=True,
+            ):
+                col_d1, col_d2, col_d3 = st.columns(3)
+                with col_d1:
+                    st.markdown("**진입 정보**")
+                    st.write(f"- 1차 매수가: **{entry_price:,.0f}** 원")
+                    if dca_done:
+                        st.write(f"- 평균단가 (DCA): **{avg_price:,.0f}** 원")
+                    st.write(f"- 보유 수량: `{coin_qty:.8f}`")
+                    st.write(f"- 고점: {highest_price:,.0f} 원")
+                with col_d2:
+                    st.markdown("**TP / SL**")
+                    if tp_price and cur_price:
+                        tp_dist = (tp_price - cur_price) / cur_price * 100
+                        st.write(f"- 익절가 (TP): **{tp_price:,.0f}** 원  `{tp_dist:+.2f}%`")
+                    if sl_price and cur_price:
+                        sl_dist = (sl_price - cur_price) / cur_price * 100
+                        st.write(f"- 손절가 (SL): **{sl_price:,.0f}** 원  `{sl_dist:+.2f}%`")
+                with col_d3:
+                    st.markdown("**기능 활성 여부**")
+                    st.write(f"- DCA 2차 매수: {'✅ 완료' if dca_done else '⏳ 대기 중'}")
+                    st.write(f"- 본전 보호 스탑: {'✅ 활성' if be_activated else '❌ 미활성'}")
+
+                if all([avg_price, cur_price, tp_price, sl_price]):
+                    st.markdown("**가격 레벨 시각화**")
+                    level_data = pd.DataFrame({
+                        "가격": [sl_price, avg_price, cur_price, tp_price],
+                        "레이블": ["손절(SL)", "평균진입가", "현재가", "익절(TP)"],
+                    }).set_index("레이블")
+                    st.bar_chart(level_data, use_container_width=True, height=200)
+
+        # 매수 대기 중인 주문도 표시
+        if _live_pending:
+            st.markdown("**⏳ 매수 대기 중**")
+            for pb in _live_pending:
+                pb_mkt    = pb.get("market", "")
+                pb_price  = pb.get("buy_price", 0)
+                pb_amount = pb.get("buy_amount", 0)
+                pb_cur    = pyupbit.get_current_price(pb_mkt) if pb_mkt else 0
+                st.info(
+                    f"**{pb_mkt}** 지정가 매수 대기 중 — "
+                    f"주문가: {fmt_price(pb_price)} | 현재가: {fmt_price(pb_cur) if pb_cur else '—'} | "
+                    f"금액: {pb_amount:,.0f}원"
+                )
+
+    elif _live_pending:
+        _pb0 = _live_pending[0]
+        pb_mkt    = _pb0.get("market", "")
+        pb_price  = _pb0.get("buy_price", 0)
+        pb_amount = _pb0.get("buy_amount", 0)
+        pb_cur = pyupbit.get_current_price(pb_mkt) if pb_mkt else 0
+
+        kpi_cols[1].metric("대기 매수가", fmt_price(pb_price))
+        kpi_cols[2].metric("주문 금액", f"{pb_amount:,.0f} 원")
+        kpi_cols[3].metric("현재가", fmt_price(pb_cur) if pb_cur else "—")
+
+        st.markdown("---")
+        for pb in _live_pending:
+            _pb_mkt    = pb.get("market", "")
+            _pb_price  = pb.get("buy_price", 0)
+            _pb_amount = pb.get("buy_amount", 0)
+            _pb_cur    = pyupbit.get_current_price(_pb_mkt) if _pb_mkt else 0
+            st.info(
+                f"**{_pb_mkt}** 지정가 매수 주문 대기 중\n\n"
+                f"주문가: **{fmt_price(_pb_price)}** | 현재가: {fmt_price(_pb_cur) if _pb_cur else '—'} | "
+                f"금액: {_pb_amount:,.0f}원\n\n"
+                "현재가가 주문가 이하로 내려오면 체결됩니다. (최대 30분 대기)"
+            )
 
     else:
         kpi_cols[1].metric("포지션", "없음")
@@ -818,16 +847,16 @@ if page == "🔴 실시간 현황":
         # 코인별 dict (market → pos) — live_status 데이터로 덮어쓸 기준
         _pos_map: dict = {p["market"]: dict(p, tp=0, sl=0, live=False) for p in _all_db_pos}
 
-        # 봇이 POSITION 상태면 현재 활성 포지션을 live 데이터로 업데이트
-        if raw_state == "position" and live.get("entry_price"):
-            _live_mkt = live.get("market", "")
+        # 봇 활성 포지션을 live_status 데이터로 업데이트 (멀티포지션)
+        for _lp in live.get("positions", []):
+            _live_mkt = _lp.get("market", "")
             if _live_mkt:
                 _pos_map[_live_mkt] = {
                     "market":      _live_mkt,
-                    "coin_qty":    live.get("coin_qty", 0),
-                    "entry_price": live.get("avg_entry_price") or live.get("entry_price", 0),
-                    "tp":          live.get("tp_price", 0),
-                    "sl":          live.get("sl_price", 0),
+                    "coin_qty":    _lp.get("coin_qty", 0),
+                    "entry_price": _lp.get("avg_entry_price") or _lp.get("entry_price", 0),
+                    "tp":          _lp.get("tp_price", 0),
+                    "sl":          _lp.get("sl_price", 0),
                     "live":        True,
                 }
 
