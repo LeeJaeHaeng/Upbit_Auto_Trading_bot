@@ -681,23 +681,39 @@ if page == "🔴 실시간 현황":
     st.markdown("---")
 
     # ── KPI 행 ──
-    # DB balance_snapshots가 항상 정확한 누적 잔고의 원본.
-    # live_status.json은 구 봇 코드에서 1,000,000원으로 초기화될 수 있으므로
-    # 실행/정지 구분 없이 DB를 우선하고 DB 기록이 없을 때만 live_status 사용.
-    live_paper_capital = live.get("paper_capital", 0)
+    # 모의 총자산: performance.json paper_current (완료거래 PnL 누적) 기준 — 가장 신뢰도 높음.
+    # DB balance_snapshots의 krw_balance는 봇 내부 현금 변수인데 버그로 오염될 수 있으므로
+    # 표시 기준으로는 사용하지 않음. DB 값은 봇 재시작 시 복원 용도로만 사용.
+    perf = load_performance()
+    paper_current_perf = perf.get("paper_current", 0)  # 완료 거래 기준 총자산
+    paper_start = perf.get("paper_capital", 1_000_000)  # 시작 자본 (보통 100만)
+
+    # DB 현금 잔고 (참고용 — 포지션 보유 중 낮아 보임)
     try:
         import backtest_db as _bdb_dash
         db_capital = _bdb_dash.get_last_paper_capital(fallback=None)
-        paper_capital = db_capital if db_capital is not None else live_paper_capital
     except Exception:
-        paper_capital = live_paper_capital
+        db_capital = None
+    # 실시간 현황 페이지의 paper_capital (자산 요약 섹션에서 사용)
+    paper_capital = db_capital if db_capital is not None else live.get("paper_capital", paper_start)
+
     kpi_cols = st.columns(4)
 
-    kpi_cols[0].metric(
-        "모의 잔고",
-        f"{paper_capital:,.0f} 원",
-        help="현재 페이퍼 트레이딩 잔고 (매수 후에는 잔고가 줄고 매도 후 복구됩니다)",
-    )
+    if paper_current_perf:
+        _perf_delta_pct = (paper_current_perf / paper_start - 1) * 100
+        kpi_cols[0].metric(
+            "모의 총자산",
+            f"{paper_current_perf:,.0f} 원",
+            delta=f"{_perf_delta_pct:+.2f}% (시작 대비)",
+            delta_color="normal",
+            help="시작 자본 + 완료된 거래 누적 PnL (performance.json 기준). 현재 포지션 미실현 손익은 미포함.",
+        )
+    else:
+        kpi_cols[0].metric(
+            "모의 총자산",
+            f"{paper_capital:,.0f} 원",
+            help="페이퍼 트레이딩 자산 추정치",
+        )
 
     if raw_state == "position" and live.get("entry_price"):
         upnl_pct = live.get("unrealized_pct", 0)
