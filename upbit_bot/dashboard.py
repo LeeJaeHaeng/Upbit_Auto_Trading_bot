@@ -792,69 +792,102 @@ if page == "🔴 실시간 현황":
     if _is_paper:
         st.caption("📄 페이퍼 트레이딩 포지션")
 
-        # live_status에서 실시간 포지션 데이터 가져오기 (봇 실행 중 + POSITION 상태)
+        # DB에서 미청산 포지션 전체 로드
+        try:
+            import backtest_db as _bdb_pos
+            _all_db_pos = _bdb_pos.get_all_paper_positions()
+        except Exception:
+            _all_db_pos = []
+
+        # 코인별 dict (market → pos) — live_status 데이터로 덮어쓸 기준
+        _pos_map: dict = {p["market"]: dict(p, tp=0, sl=0, live=False) for p in _all_db_pos}
+
+        # 봇이 POSITION 상태면 현재 활성 포지션을 live 데이터로 업데이트
         if raw_state == "position" and live.get("entry_price"):
-            _p_market   = live.get("market", "")
-            _p_avg      = live.get("avg_entry_price") or live.get("entry_price", 0)
-            _p_qty      = live.get("coin_qty", 0)
-            _p_cur      = live.get("current_price", 0)
-            _p_eval     = live.get("position_value_krw", 0)
-            _p_upnl_krw = live.get("unrealized_krw", 0)
-            _p_upnl_pct = live.get("unrealized_pct", 0)
-            _p_tp       = live.get("tp_price", 0)
-            _p_sl       = live.get("sl_price", 0)
-            _from_db    = False
-        else:
-            # 봇이 IDLE/정지 상태여도 DB에서 마지막 미청산 포지션 복원
-            try:
-                import backtest_db as _bdb_pos
-                _db_pos = _bdb_pos.get_last_paper_position()
-            except Exception:
-                _db_pos = None
+            _live_mkt = live.get("market", "")
+            if _live_mkt:
+                _pos_map[_live_mkt] = {
+                    "market":      _live_mkt,
+                    "coin_qty":    live.get("coin_qty", 0),
+                    "entry_price": live.get("avg_entry_price") or live.get("entry_price", 0),
+                    "tp":          live.get("tp_price", 0),
+                    "sl":          live.get("sl_price", 0),
+                    "live":        True,
+                }
 
-            if _db_pos:
-                _p_market   = _db_pos["market"]
-                _p_qty      = _db_pos["coin_qty"]
-                _p_avg      = _db_pos["entry_price"]
-                _p_cur      = get_realtime_price(_p_market) if _p_market else 0
-                _p_eval     = _p_qty * _p_cur
-                _p_upnl_krw = (_p_cur - _p_avg) * _p_qty if _p_avg > 0 else 0
-                _p_upnl_pct = (_p_cur - _p_avg) / _p_avg * 100 if _p_avg > 0 else 0
-                _p_tp       = 0  # 봇 정지 상태라 TP/SL 미상
-                _p_sl       = 0
-                _from_db    = True
-            else:
-                _p_market = None
-                _from_db  = False
-
-        if _p_market:
-            if _from_db:
-                st.warning("봇이 IDLE/정지 상태입니다. DB에서 마지막 미청산 포지션을 복원해 표시합니다. (TP/SL 미상)")
+        if _pos_map:
+            if any(not v["live"] for v in _pos_map.values()):
+                st.caption("💡 일부 포지션은 DB 복원 데이터입니다 (봇 정지 중 TP/SL 미상)")
 
             def _dist(target, base):
                 if target and base:
                     return f"  ({(target - base) / base * 100:+.2f}%)"
                 return ""
 
-            _p_tp_str = f"{fmt_price(_p_tp)}{_dist(_p_tp, _p_cur)}" if _p_tp else "—"
-            _p_sl_str = f"{fmt_price(_p_sl)}{_dist(_p_sl, _p_cur)}" if _p_sl else "—"
+            _pos_rows = []
+            _total_coin_eval = 0.0
+            for _pos in _pos_map.values():
+                _mkt  = _pos["market"]
+                _qty  = _pos["coin_qty"]
+                _avg  = _pos["entry_price"]
+                _tp   = _pos.get("tp", 0)
+                _sl   = _pos.get("sl", 0)
+                # 실시간 현재가 (3초 캐시)
+                _cur  = get_realtime_price(_mkt) if _mkt else 0
+                _eval = _qty * _cur
+                _total_coin_eval += _eval
+                _upnl_krw = (_cur - _avg) * _qty if _avg > 0 else 0
+                _upnl_pct = (_cur - _avg) / _avg * 100 if _avg > 0 else 0
+                _tp_str = f"{fmt_price(_tp)}{_dist(_tp, _cur)}" if _tp else "—"
+                _sl_str = f"{fmt_price(_sl)}{_dist(_sl, _cur)}" if _sl else "—"
+                _pos_rows.append({
+                    "코인":       _mkt.replace("KRW-", ""),
+                    "수량":       f"{_qty:.8f}".rstrip("0").rstrip("."),
+                    "매수가":     fmt_price(_avg),
+                    "현재가":     fmt_price(_cur),
+                    "평가액(원)": f"{_eval:,.0f}",
+                    "미실현손익": f"{_upnl_krw:+,.0f} 원",
+                    "수익률":     f"{_upnl_pct:+.2f}%",
+                    "목표가 TP":  _tp_str,
+                    "손절가 SL":  _sl_str,
+                })
 
-            _paper_df = pd.DataFrame([{
-                "코인":       _p_market.replace("KRW-", ""),
-                "수량":       f"{_p_qty:.8f}".rstrip("0").rstrip("."),
-                "매수가":     fmt_price(_p_avg),
-                "현재가":     fmt_price(_p_cur),
-                "평가액":     f"{_p_eval:,.0f} 원",
-                "미실현손익": f"{_p_upnl_krw:+,.0f} 원",
-                "수익률":     f"{_p_upnl_pct:+.2f}%",
-                "목표가 TP":  _p_tp_str,
-                "손절가 SL":  _p_sl_str,
-            }])
-            st.dataframe(_paper_df, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_pos_rows), use_container_width=True, hide_index=True)
+
+            # ── 자산 요약 ──
+            _free_cash = paper_capital  # DB/live_status 에서 가져온 미투자 현금 잔고
+            _grand_total = _free_cash + _total_coin_eval
+            _sum_c1, _sum_c2, _sum_c3 = st.columns(3)
+            _sum_c1.metric(
+                "코인 평가액 합계",
+                f"{_total_coin_eval:,.0f} 원",
+                help="보유 코인 × 현재가 (실시간)",
+            )
+            _sum_c2.metric(
+                "미투자 모의잔고",
+                f"{_free_cash:,.0f} 원",
+                help="아직 코인을 사지 않은 남은 현금",
+            )
+            _sum_c3.metric(
+                "모의 총자산",
+                f"{_grand_total:,.0f} 원",
+                delta=f"{(_grand_total / 1_000_000 - 1) * 100:+.2f}% (초기 100만원 대비)",
+                delta_color="normal",
+                help="코인 평가액 + 미투자 잔고",
+            )
+
         elif raw_state == "buy_waiting":
             st.info(f"⏳ **{live.get('market', '')}** 매수 주문 대기 중 — 체결 후 포지션이 여기 표시됩니다.")
+            _sum_c1, _sum_c2 = st.columns(2)
+            _sum_c1.metric("미투자 모의잔고", f"{paper_capital:,.0f} 원")
+            _sum_c2.metric("모의 총자산", f"{paper_capital:,.0f} 원",
+                           delta=f"{(paper_capital / 1_000_000 - 1) * 100:+.2f}%", delta_color="normal")
         else:
             st.info("현재 보유 중인 포지션이 없습니다.")
+            _sc1, _sc2 = st.columns(2)
+            _sc1.metric("미투자 모의잔고", f"{paper_capital:,.0f} 원")
+            _sc2.metric("모의 총자산", f"{paper_capital:,.0f} 원",
+                        delta=f"{(paper_capital / 1_000_000 - 1) * 100:+.2f}%", delta_color="normal")
 
     # ▶ 실제 업비트 지갑
     st.caption("💰 실제 업비트 지갑")

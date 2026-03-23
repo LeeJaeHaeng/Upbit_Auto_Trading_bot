@@ -447,58 +447,66 @@ def get_last_paper_capital(fallback: float = 1_000_000) -> float:
 
 
 def get_last_paper_position() -> dict | None:
-    """
-    DB에서 마지막으로 기록된 페이퍼 매수 포지션 반환.
-    마지막 buy 이후 sell이 없으면 미청산 포지션으로 판단.
+    """단일 포지션 반환 (하위 호환 래퍼). get_all_paper_positions()[0] 반환."""
+    positions = get_all_paper_positions()
+    return positions[0] if positions else None
 
-    반환: {"market", "coin_qty", "entry_price", "snapshot_at"} 또는 None
+
+def get_all_paper_positions() -> list:
+    """
+    DB에서 미청산 페이퍼 매수 포지션 전체 반환.
+    마지막 sell 이후 buy가 있으면 미청산으로 판단, 코인별 최신 1건씩 반환.
+
+    반환: [{"market", "coin_qty", "entry_price", "snapshot_at"}, ...]
     """
     import re
     try:
         init_db()
         with _connect() as conn:
-            buy_row = conn.execute("""
-                SELECT snapshot_at, coin_market, coin_qty, note
+            # 가장 최근 sell 시각 조회
+            last_sell = conn.execute("""
+                SELECT MAX(snapshot_at) FROM balance_snapshots
+                WHERE mode = 'paper' AND trigger = 'sell'
+            """).fetchone()[0]
+
+            # 마지막 sell 이후 코인별 최신 buy 1건씩 가져오기
+            query = """
+                SELECT coin_market, MAX(snapshot_at) as last_buy, coin_qty, note
                 FROM balance_snapshots
                 WHERE mode = 'paper'
                   AND trigger = 'buy'
                   AND coin_market IS NOT NULL
                   AND coin_qty > 0
-                ORDER BY snapshot_at DESC
-                LIMIT 1
-            """).fetchone()
-            if not buy_row:
-                return None
+            """
+            params = []
+            if last_sell:
+                query += " AND snapshot_at > ?"
+                params.append(last_sell)
+            query += " GROUP BY coin_market ORDER BY last_buy DESC"
 
-            # 마지막 buy 이후에 sell이 있는지 확인
-            sell_after = conn.execute("""
-                SELECT 1 FROM balance_snapshots
-                WHERE mode = 'paper'
-                  AND trigger = 'sell'
-                  AND snapshot_at > ?
-                LIMIT 1
-            """, (buy_row["snapshot_at"],)).fetchone()
-            if sell_after:
-                return None  # 이미 매도됨
+            rows = conn.execute(query, params).fetchall()
+            if not rows:
+                return []
 
-            # note에서 진입가 파싱: "매수 KRW-WCT 96원" 형태
-            entry_price = 0.0
-            if buy_row["note"]:
-                m = re.search(r'([\d,\.]+)원', buy_row["note"])
-                if m:
-                    try:
-                        entry_price = float(m.group(1).replace(",", ""))
-                    except ValueError:
-                        pass
-
-            return {
-                "market":      buy_row["coin_market"],
-                "coin_qty":    float(buy_row["coin_qty"]),
-                "entry_price": entry_price,
-                "snapshot_at": buy_row["snapshot_at"],
-            }
+            result = []
+            for row in rows:
+                entry_price = 0.0
+                if row["note"]:
+                    m = re.search(r'([\d,]+(?:\.\d+)?)원', row["note"])
+                    if m:
+                        try:
+                            entry_price = float(m.group(1).replace(",", ""))
+                        except ValueError:
+                            pass
+                result.append({
+                    "market":      row["coin_market"],
+                    "coin_qty":    float(row["coin_qty"]),
+                    "entry_price": entry_price,
+                    "snapshot_at": row["last_buy"],
+                })
+            return result
     except Exception:
-        return None
+        return []
 
 
 def start_trading_session(mode: str, config) -> int:
